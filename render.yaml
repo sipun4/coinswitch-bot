@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: coinswitch-smart-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+    envVars:
+      - key: CS_API_KEY
+        sync: false          # you enter this on Render dashboard
+      - key: CS_SECRET_KEY
+        sync: false
+      - key: GMAIL_USER
+        sync: false
+      - key: GMAIL_PASS
+        sync: false
+      - key: ALERT_EMAIL
+        sync: false
+      - key: CAPITAL
+        value: "300"
