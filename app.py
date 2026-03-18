@@ -391,21 +391,68 @@ def get_trade_info(symbol):
         pass
     return {}
 
+def get_best_price(symbol, side):
+    """
+    Get best available price from depth/orderbook.
+    For BUY use best ask, for SELL use best bid.
+    """
+    ep = "/trade/api/v2/depth"
+    params = {"symbol": symbol.lower()}
+    try:
+        # Depth is a public endpoint — no auth needed
+        r = requests.get(
+            BASE_URL + ep,
+            params=params,
+            headers={"Content-Type": "application/json"},
+            timeout=8
+        )
+        data = r.json()
+        if side.upper() == "BUY":
+            # asks[0] = lowest ask price (best price to buy)
+            asks = data.get("data", {}).get("asks", [])
+            if asks:
+                return float(asks[0][0])
+        else:
+            # bids[0] = highest bid price (best price to sell)
+            bids = data.get("data", {}).get("bids", [])
+            if bids:
+                return float(bids[0][0])
+    except Exception as e:
+        log(f"Depth fetch error: {e}", "ERR")
+    return None
+
 def place_order(symbol, side, amount_inr, price):
     """
-    Place a real market order on CoinSwitch PRO.
-    Uses correct Ed25519 signature as per official docs.
+    Place a LIMIT order on CoinSwitch PRO (market orders need price too).
+    Uses Ed25519 signature + price from live orderbook.
     """
     ep  = "/trade/api/v2/order"
-    # Symbol format: lowercase with slash e.g. "doge/inr"
     sym = symbol.lower()
-    qty = round(amount_inr / price, 4)
+
+    # Try to get live best price from orderbook
+    live_price = get_best_price(symbol, side)
+    if live_price:
+        # Use live price with small buffer for fills:
+        # BUY: pay slightly above best ask (ensures fill)
+        # SELL: accept slightly below best bid (ensures fill)
+        if side.upper() == "BUY":
+            order_price = round(live_price * 1.002, 8)  # 0.2% above ask
+        else:
+            order_price = round(live_price * 0.998, 8)  # 0.2% below bid
+        log(f"Live orderbook price for {sym}: ₹{live_price} → order @ ₹{order_price}", "ORDER")
+    else:
+        # Fallback to Binance price passed in
+        order_price = round(price, 8)
+        log(f"Using Binance fallback price: ₹{order_price}", "ORDER")
+
+    qty = round(amount_inr / order_price, 4)
 
     payload = {
         "symbol":   sym,
-        "side":     side.lower(),    # "buy" or "sell"
-        "type":     "market",
-        "quantity": qty,
+        "side":     side.lower(),
+        "type":     "limit",
+        "price":    str(order_price),
+        "quantity": str(qty),
     }
     body = json.dumps(payload, separators=(',', ':'))
 
@@ -418,7 +465,7 @@ def place_order(symbol, side, amount_inr, price):
             timeout=15
         )
         result = r.json()
-        log(f"Order response [{r.status_code}]: {json.dumps(result)[:200]}", "ORDER")
+        log(f"Order [{r.status_code}] {side} {sym} qty:{qty} @ ₹{order_price}: {json.dumps(result)[:200]}", "ORDER")
         return result
     except Exception as e:
         log(f"Order exception: {e}", "ERR")
@@ -433,6 +480,34 @@ def get_portfolio():
         return r.json()
     except Exception as e:
         return {"error": str(e)}
+
+# Cache exchange precision info
+_precision_cache = {}
+
+def get_precision(symbol):
+    """
+    Get min order size and decimal precision for a symbol.
+    Cached after first fetch.
+    """
+    global _precision_cache
+    sym = symbol.lower()
+    if sym in _precision_cache:
+        return _precision_cache[sym]
+    try:
+        ep = "/trade/api/v2/exchangePrecision"
+        payload = json.dumps({"symbols": [sym]}, separators=(',', ':'))
+        headers = make_headers("POST", ep)
+        r = requests.post(BASE_URL + ep, headers=headers, data=payload, timeout=10)
+        data = r.json()
+        # Response has precision data per symbol
+        for item in data.get("data", []):
+            if item.get("symbol","").lower() == sym:
+                _precision_cache[sym] = item
+                log(f"Precision for {sym}: {item}", "INFO")
+                return item
+    except Exception as e:
+        log(f"Precision fetch error: {e}", "ERR")
+    return {}
 
 def validate_keys():
     """Test if API keys work."""
@@ -511,6 +586,51 @@ def api_stop():
     state["sensei_mood"] = "RESTING"
     log(f"🏁 Session ended | P&L: ₹{state['total_pnl']:.2f} | WR: {win_rate():.1f}%", "STOP")
     return jsonify({"ok":True})
+
+@app.route("/api/debug/keys")
+def debug_keys():
+    """Test API keys and return detailed diagnosis."""
+    results = {}
+
+    # Check key format
+    key_len = len(CS_API_KEY)
+    secret_len = len(CS_SECRET_KEY)
+    results["api_key_length"] = key_len
+    results["secret_key_length"] = secret_len
+    results["secret_is_hex"] = all(c in "0123456789abcdefABCDEF" for c in CS_SECRET_KEY)
+    results["secret_is_64_chars"] = secret_len == 64
+    results["api_key_set"] = CS_API_KEY != "YOUR_COINSWITCH_API_KEY"
+    results["secret_key_set"] = CS_SECRET_KEY != "YOUR_COINSWITCH_SECRET_KEY"
+
+    # Try server time (no auth needed)
+    try:
+        r = requests.get("https://coinswitch.co/trade/api/v2/time", timeout=8)
+        results["server_time_status"] = r.status_code
+        results["server_time"] = r.json()
+    except Exception as e:
+        results["server_time_error"] = str(e)
+
+    # Try validate keys
+    try:
+        ep = "/trade/api/v2/validate/keys"
+        headers = make_headers("GET", ep)
+        r = requests.get("https://coinswitch.co" + ep, headers=headers, timeout=10)
+        results["validate_status"] = r.status_code
+        results["validate_response"] = r.text[:300]
+    except Exception as e:
+        results["validate_error"] = str(e)
+
+    # Try portfolio
+    try:
+        ep = "/trade/api/v2/user/portfolio"
+        headers = make_headers("GET", ep)
+        r = requests.get("https://coinswitch.co" + ep, headers=headers, timeout=10)
+        results["portfolio_status"] = r.status_code
+        results["portfolio_response"] = r.text[:300]
+    except Exception as e:
+        results["portfolio_error"] = str(e)
+
+    return jsonify(results)
 
 @app.route("/api/candles", methods=["POST"])
 def api_candles():
