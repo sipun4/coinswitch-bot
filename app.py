@@ -39,14 +39,22 @@ ALERT_EMAIL   = os.environ.get("ALERT_EMAIL",   "your@gmail.com")
 CAPITAL       = float(os.environ.get("CAPITAL", "300"))
 ACCESS_KEY    = os.environ.get("ACCESS_KEY",    "sensei2024")
 BASE_URL      = "https://coinswitch.co"
-EXCHANGE      = "coinswitchx"   # Primary INR exchange per docs
+EXCHANGE      = "coinswitchx"   # Default exchange
+EXCHANGES     = ["coinswitchx", "wazirx"]  # All supported exchanges
 
-# All trading pairs — UPPERCASE with slash (exact format from docs)
-ALL_PAIRS = [
+# Desired pairs — bot auto-discovers which are available on coinswitchx
+# MATIC was rebranded to POL in Sept 2024
+DESIRED_PAIRS = [
     "DOGE/INR", "XRP/INR",  "TRX/INR",  "SHIB/INR",
-    "BNB/INR",  "ADA/INR",  "MATIC/INR","LTC/INR",
+    "BNB/INR",  "ADA/INR",  "POL/INR",  "LTC/INR",
     "LINK/INR", "DOT/INR",  "SOL/INR",  "AVAX/INR",
+    "BTC/INR",  "ETH/INR",  "PEPE/INR", "WIF/INR",
+    "SUI/INR",  "TON/INR",  "APT/INR",  "NEAR/INR",
 ]
+# Will be populated by discover_exchange_map() on startup
+# Maps symbol -> exchange: {"MATIC/INR": "wazirx", "DOGE/INR": "coinswitchx", ...}
+SYMBOL_EXCHANGE_MAP = {}
+ALL_PAIRS = list(DESIRED_PAIRS)  # Active pairs (filtered to available ones)
 
 # Strategy settings
 ATR_TP_MULT        = 2.0
@@ -171,10 +179,11 @@ def fetch_exchange_precision(symbol):
     if symbol in state["precision_cache"]:
         return state["precision_cache"][symbol]
     try:
+        sym_exch = SYMBOL_EXCHANGE_MAP.get(symbol, EXCHANGE)
         code, data = cs_post("/trade/api/v2/exchangePrecision",
-                             {"exchange": EXCHANGE, "symbol": symbol})
+                             {"exchange": sym_exch, "symbol": symbol})
         if code == 200:
-            prec = data.get("data", {}).get(EXCHANGE, {}).get(symbol, {})
+            prec = data.get("data", {}).get(sym_exch, {}).get(symbol, {})
             if prec:
                 state["precision_cache"][symbol] = prec
                 log(f"Precision {symbol}: base={prec.get('base')} quote={prec.get('quote')} limit={prec.get('limit')}", "INFO")
@@ -189,7 +198,9 @@ def fetch_depth(symbol):
     Returns best bid/ask for accurate order pricing.
     """
     try:
-        code, data = cs_get("/trade/api/v2/depth", {"symbol": symbol})
+        sym_exch = SYMBOL_EXCHANGE_MAP.get(symbol, EXCHANGE)
+        code, data = cs_get("/trade/api/v2/depth",
+                            {"symbol": symbol, "exchange": sym_exch})
         if code == 200:
             d = data.get("data", {})
             asks = d.get("asks", [])
@@ -272,15 +283,16 @@ def place_order(symbol, side, amount_inr, fallback_price):
 
     # Step 5: Build payload — EXACTLY as per CoinSwitch docs
     payload = {
-        "symbol":   symbol,          # "MATIC/INR" — UPPERCASE with slash
-        "side":     side.lower(),    # "buy" or "sell"
+        "symbol":   symbol,             # "MATIC/INR" — UPPERCASE with slash
+        "side":     side.lower(),       # "buy" or "sell"
         "type":     "limit",
-        "price":    order_price,     # float, not string
-        "quantity": quantity,        # float, not string
-        "exchange": EXCHANGE,        # "coinswitchx"
+        "price":    order_price,        # float
+        "quantity": quantity,           # float
+        "exchange": symbol_exchange,    # correct exchange per symbol
     }
 
-    log(f"Placing {side} {symbol} qty:{quantity} @ ₹{order_price} on {EXCHANGE}", "ORDER")
+    symbol_exchange = SYMBOL_EXCHANGE_MAP.get(symbol, EXCHANGE)
+    log(f"Placing {side} {symbol} qty:{quantity} @ ₹{order_price} on {symbol_exchange}", "ORDER")
     try:
         code, data = cs_post("/trade/api/v2/order", payload)
         log(f"Order [{code}]: {json.dumps(data)[:200]}", "ORDER")
@@ -563,14 +575,53 @@ def api_start():
     log(f"📋 Signal threshold: {SENSEI_MIN_SIGNALS}/6 | Min order: ₹{MIN_ORDER_INR} | Max daily loss: {MAX_DAILY_LOSS_PCT*100:.0f}%", "INFO")
 
     def startup():
+        global SYMBOL_EXCHANGE_MAP, ALL_PAIRS
         time.sleep(0.5)
         ok = validate_keys()
-        if ok:
-            log("✅ API keys valid — LIVE trading on CoinSwitch PRO", "START")
-            time.sleep(0.3)
-            fetch_wallet()
-        else:
-            log("❌ API key validation FAILED — check Render env vars CS_API_KEY / CS_SECRET_KEY", "ERR")
+        if not ok:
+            log("❌ API key validation FAILED — check Render env vars", "ERR")
+            return
+        log("✅ API keys valid — LIVE trading on CoinSwitch PRO", "START")
+        time.sleep(0.2)
+
+        # Build symbol→exchange map from CoinSwitch coins API
+        sym_map = {}
+        for exchange in EXCHANGES:
+            try:
+                code, data = cs_get("/trade/api/v2/coins", {"exchange": exchange})
+                if code == 200:
+                    coins = data.get("data", {}).get(exchange, [])
+                    for coin in coins:
+                        if coin not in sym_map:  # coinswitchx takes priority
+                            sym_map[coin] = exchange
+                    log(f"📋 {exchange}: {len(coins)} coins available", "INFO")
+            except Exception as e:
+                log(f"Coins fetch error {exchange}: {e}", "ERR")
+
+        SYMBOL_EXCHANGE_MAP = sym_map
+
+        # Find which desired pairs are actually available
+        tradeable = [p for p in DESIRED_PAIRS if p in sym_map]
+
+        if not tradeable:
+            # Fallback: pick first 12 INR pairs from coinswitchx
+            cs_coins = [c for c,e in sym_map.items() if c.endswith("/INR") and e=="coinswitchx"]
+            tradeable = cs_coins[:12]
+            log(f"⚠️ None of desired pairs found — using top {len(tradeable)} from coinswitchx", "WARN")
+
+        ALL_PAIRS[:] = tradeable   # in-place update so module-level var changes
+        log(f"✅ Exchange map: {len(sym_map)} coins available", "INFO")
+        log(f"✅ Trading {len(ALL_PAIRS)} pairs: {', '.join(ALL_PAIRS)}", "INFO")
+
+        # Show which desired pairs exist and which don't
+        for pair in DESIRED_PAIRS:
+            exch = sym_map.get(pair)
+            if exch:
+                log(f"  ✅ {pair} → {exch}", "INFO")
+            else:
+                log(f"  ❌ {pair} → NOT on any exchange (skip)", "WARN")
+        time.sleep(0.2)
+        fetch_wallet()
     threading.Thread(target=startup, daemon=True).start()
     return jsonify({"ok": True})
 
