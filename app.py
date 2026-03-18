@@ -458,14 +458,23 @@ def place_order(symbol, side, amount_inr, price):
         order_price = round(price, 8)
         log(f"Using Binance fallback price: ₹{order_price}", "ORDER")
 
-    qty = round(amount_inr / order_price, 4)
+    # Calculate quantity — for micro-priced coins (SHIB etc) use less decimals
+    raw_qty = amount_inr / order_price
+    # Use 0 decimal places for large quantities (>1000 units), 4 for small
+    if raw_qty >= 1000:
+        qty = round(raw_qty, 0)
+    elif raw_qty >= 10:
+        qty = round(raw_qty, 2)
+    else:
+        qty = round(raw_qty, 4)
 
+    # CoinSwitch requires price and quantity as numbers (not strings)
     payload = {
         "symbol":   sym,
         "side":     side.lower(),
         "type":     "limit",
-        "price":    str(order_price),
-        "quantity": str(qty),
+        "price":    float(round(order_price, 8)),
+        "quantity": float(round(qty, 4)),
     }
     body = json.dumps(payload, separators=(',', ':'))
 
