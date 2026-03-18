@@ -292,6 +292,7 @@ def place_order(symbol, side, amount_inr, fallback_price):
     }
 
     symbol_exchange = SYMBOL_EXCHANGE_MAP.get(symbol, EXCHANGE)
+    log(f"🔔 ORDER ATTEMPT: {side} {symbol} exchange={symbol_exchange} map_size={len(SYMBOL_EXCHANGE_MAP)}", "ORDER")
     log(f"Placing {side} {symbol} qty:{quantity} @ ₹{order_price} on {symbol_exchange}", "ORDER")
     try:
         code, data = cs_post("/trade/api/v2/order", payload)
@@ -757,7 +758,9 @@ def api_candles():
         for name, fired in sigs.items():
             log(f"  {'✅' if fired else '⬜'} {name}", "SIG")
 
+        log(f"📤 Calling place_order for {sym} @ ₹{price:.6f} pos=₹{pos}", "TRADE")
         code, result = place_order(sym, "BUY", pos, price)
+        log(f"📥 place_order returned code={code} result={str(result)[:150]}", "TRADE")
         if code == 200:
             entry = best["price"]
             state.update({
