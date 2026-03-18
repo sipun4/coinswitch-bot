@@ -281,19 +281,19 @@ def place_order(symbol, side, amount_inr, fallback_price):
         amount_inr  = MIN_ORDER_INR
         quantity    = round(amount_inr / order_price, base_prec)
 
-    # Step 5: Build payload — EXACTLY as per CoinSwitch docs
-    payload = {
-        "symbol":   symbol,             # "MATIC/INR" — UPPERCASE with slash
-        "side":     side.lower(),       # "buy" or "sell"
-        "type":     "limit",
-        "price":    order_price,        # float
-        "quantity": quantity,           # float
-        "exchange": symbol_exchange,    # correct exchange per symbol
-    }
-
+    # Step 5: Get correct exchange FIRST, then build payload
     symbol_exchange = SYMBOL_EXCHANGE_MAP.get(symbol, EXCHANGE)
-    log(f"🔔 ORDER ATTEMPT: {side} {symbol} exchange={symbol_exchange} map_size={len(SYMBOL_EXCHANGE_MAP)}", "ORDER")
-    log(f"Placing {side} {symbol} qty:{quantity} @ ₹{order_price} on {symbol_exchange}", "ORDER")
+    log(f"🔔 ORDER: {side} {symbol} exchange={symbol_exchange} qty={quantity} price={order_price}", "ORDER")
+
+    payload = {
+        "symbol":   symbol,
+        "side":     side.lower(),
+        "type":     "limit",
+        "price":    order_price,
+        "quantity": quantity,
+        "exchange": symbol_exchange,
+    }
+    log(f"Payload: {json.dumps(payload)}", "ORDER")
     try:
         code, data = cs_post("/trade/api/v2/order", payload)
         log(f"Order [{code}]: {json.dumps(data)[:200]}", "ORDER")
