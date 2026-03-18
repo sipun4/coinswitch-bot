@@ -1,16 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  SENSEI BOT v5 — Built from CoinSwitch API docs ground-up        ║
-║  Source: https://api-trading.coinswitch.co/                      ║
-║                                                                  ║
-║  KEY FACTS FROM DOCS:                                            ║
-║  • Symbol format:  "BTC/INR"  (UPPERCASE with slash)             ║
-║  • Exchange:       "coinswitchx" (primary INR exchange)          ║
-║  • Order type:     "limit" with price required                   ║
-║  • Signature:      Ed25519, message = METHOD + endpoint + epoch  ║
-║  • Headers:        X-AUTH-APIKEY, X-AUTH-SIGNATURE, X-AUTH-EPOCH ║
-║  • Portfolio:      GET /trade/api/v2/user/portfolio               ║
-║  • Precision:      POST /trade/api/v2/exchangePrecision           ║
+║  SENSEI BOT v6 — REALTIME WebSocket Edition                       ║
+║  CoinSwitch WebSocket: wss://ws.coinswitch.co/                   ║
+║  Live ticker every 1 second — instant SL/TP execution            ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -24,6 +16,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, render_template, jsonify, request, session, redirect, url_for
 from collections import deque
+import socketio as sio_client
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
@@ -57,13 +50,18 @@ SYMBOL_EXCHANGE_MAP = {}
 ALL_PAIRS = list(DESIRED_PAIRS)  # Active pairs (filtered to available ones)
 
 # Strategy settings — tuned for maximum win rate
-ATR_TP_MULT        = 3.0   # TP at 3x ATR — bigger target, let winners run
-ATR_SL_MULT        = 0.8   # SL at 0.8x ATR — tight stop, cut losses fast
-MIN_REWARD_RISK    = 2.5   # Only trade if reward >= 2.5x risk
-SENSEI_MIN_SIGNALS = 5     # Require 5/6 signals — high-confidence only
-MAX_DAILY_TRADES   = 6     # Fewer, higher-quality trades
-MAX_DAILY_LOSS_PCT = 0.04  # Stop day at 4% loss — protect capital
-MIN_ORDER_INR      = 100.0 # Safe buffer above CoinSwitch ₹50 minimum
+ATR_TP_MULT        = 3.0   # TP at 3x ATR — let winners run
+ATR_SL_MULT        = 0.8   # SL at 0.8x ATR — cut losses fast
+MIN_REWARD_RISK    = 2.5   # Only trade reward >= 2.5x risk
+SENSEI_MIN_SIGNALS = 5     # Require 5/6 signals — high confidence only
+MAX_DAILY_TRADES   = 6     # Fewer, better quality trades
+MAX_DAILY_LOSS_PCT = 0.04  # Stop day at 4% loss
+MIN_ORDER_INR      = 100.0 # Safe buffer above CoinSwitch minimum
+
+# WebSocket config — CoinSwitch realtime ticker
+WS_BASE_URL      = "https://ws.coinswitch.co"
+WS_SOCKET_PATH   = "pro/realtime-rates-socket/spot"
+WS_NAMESPACE     = "/coinswitchx"
 
 # ══════════════════════════════════════════════════════════
 #  STATE
@@ -88,6 +86,9 @@ state = {
     },
     "precision_cache": {},   # {symbol: {base, quote, limit}}
     "open_order_id": None,   # Track open order for status checking
+    "live_prices": {},       # {symbol: float} — realtime from WebSocket
+    "ws_connected": False,   # WebSocket connection status
+    "ws_subscribed": [],     # symbols currently subscribed
 }
 
 def log(msg, level="INFO"):
@@ -149,7 +150,7 @@ def cs_post(endpoint, payload):
     return r.status_code, r.json()
 
 def cs_delete(endpoint, payload):
-    """Authenticated DELETE — docs: signature = method + endpoint + epoch_time (NOT body)."""
+    """Authenticated DELETE — docs: signature = method + endpoint + epoch_time."""
     epoch_time  = str(int(time.time() * 1000))
     sig_msg     = "DELETE" + endpoint + epoch_time
     private_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(CS_SECRET_KEY))
@@ -163,6 +164,194 @@ def cs_delete(endpoint, payload):
     r = requests.delete(BASE_URL + endpoint, headers=headers,
                         data=json.dumps(payload, separators=(',', ':')), timeout=12)
     return r.status_code, r.json()
+
+# ══════════════════════════════════════════════════════════
+#  REALTIME WEBSOCKET — CoinSwitch live ticker
+#  Docs: wss://ws.coinswitch.co/
+#  Event: FETCH_TRADES_CS_PRO  (live trade prices)
+#  Namespace: /coinswitchx
+# ══════════════════════════════════════════════════════════
+_ws_sio   = None   # socket.io client instance
+_ws_lock  = threading.Lock()
+
+def _ws_on_trade(data):
+    """Called on every live trade — updates live_prices and checks SL/TP instantly."""
+    try:
+        sym_raw = data.get("s", "")                    # e.g. "DOGE,INR"
+        price   = float(data.get("p", 0))
+        if not sym_raw or not price:
+            return
+        symbol = sym_raw.replace(",", "/")             # → "DOGE/INR"
+        state["live_prices"][symbol] = price
+
+        # ── Realtime SL/TP check ──────────────────────────
+        if not state["in_trade"] or state["trade_sym"] != symbol:
+            return
+
+        entry   = state["entry_price"]
+        tp      = state["tp_price"]
+        sl      = state["sl_price"]
+        pos     = state.get("position_size", state["per_trade"])
+        lpnl    = round((price - entry) / entry * pos, 2)
+        state["live_pnl"] = lpnl
+
+        # Trailing stop update
+        if price > state["peak_price"]:
+            state["peak_price"] = price
+            atr_approx = (tp - entry) / ATR_TP_MULT   # re-derive ATR from stored TP
+            new_sl = price - atr_approx * ATR_SL_MULT * 1.5
+            if new_sl > state["trail_sl"]:
+                state["trail_sl"] = new_sl
+                if new_sl > state["sl_price"]:
+                    state["sl_price"] = new_sl
+                    log(f"📈 Trail SL → ₹{new_sl:.6f}", "TRAIL")
+
+        reason = None
+        if   price >= tp:          reason = "TAKE_PROFIT ✅"
+        elif price <= sl:          reason = "STOP_LOSS 🛑"
+
+        if reason:
+            log(f"⚡ REALTIME EXIT: {symbol} @ ₹{price:.6f} | {reason}", "TRADE")
+            threading.Thread(target=_execute_exit,
+                             args=(symbol, pos, price, reason), daemon=True).start()
+    except Exception as e:
+        log(f"WS trade handler error: {e}", "ERR")
+
+def _execute_exit(sym, pos, price, reason):
+    """Run in a thread — cancel BUY if open, then SELL with retries."""
+    with _ws_lock:
+        if not state["in_trade"] or state["trade_sym"] != sym:
+            return   # already closed by another call
+        open_oid = state.get("open_order_id")
+        if open_oid:
+            buy_status = get_order_status(open_oid)
+            if buy_status in ("OPEN", "PARTIALLY_EXECUTED", "CANCELLATION_RAISED"):
+                log("⚠️ Cancelling unfilled BUY before SELL...", "ORDER")
+                cancel_order(open_oid)
+                time.sleep(1)
+
+        sell_code = 0
+        for attempt in range(3):
+            sell_code, sell_result = place_order(sym, "SELL", pos, price)
+            if sell_code == 200:
+                break
+            log(f"⚠️ SELL attempt {attempt+1} failed [{sell_code}] — retrying 2s", "WARN")
+            time.sleep(2)
+
+        if sell_code != 200:
+            log(f"❌ SELL failed after 3 attempts on {sym}", "ERR")
+            return
+
+        pnl = round((price - state["entry_price"]) / state["entry_price"] * pos, 2)
+        state["total_pnl"]    += pnl
+        state["daily_pnl"]    += pnl
+        state["current"]      += pnl
+        state["daily_trades"] += 1
+        if pnl >= 0: state["wins"]   += 1
+        else:        state["losses"] += 1
+        entry_was = state["entry_price"]
+        sigs      = state["signals_detail"].copy()
+        state["trades"].appendleft({
+            "time": state["last_scan"], "sym": sym,
+            "entry": entry_was, "exit": price,
+            "pnl": pnl, "reason": reason,
+            "signals": sum(state["signals_detail"].values()),
+        })
+        state.update({"in_trade": False, "trade_sym": None, "live_pnl": 0.0,
+                      "peak_price": 0.0, "trail_sl": 0.0, "sensei_mood": "PATIENT",
+                      "open_order_id": None, "position_size": 0.0})
+        log(f"{'💰 WIN' if pnl>=0 else '🛑 LOSS'} {sym} ₹{pnl:+.2f} | Total ₹{state['total_pnl']:.2f} | WR {win_rate():.1f}%",
+            "WIN" if pnl>=0 else "LOSS")
+        fetch_wallet()
+        threading.Thread(target=send_alert,
+                         args=(sym, entry_was, price, pnl, reason, sigs), daemon=True).start()
+        # Unsubscribe from this symbol after exit
+        ws_unsubscribe(sym)
+
+def ws_subscribe(symbol):
+    """Subscribe to live trades for a symbol."""
+    global _ws_sio
+    pair = symbol.replace("/", ",")   # "DOGE/INR" → "DOGE,INR"
+    try:
+        if _ws_sio and _ws_sio.connected:
+            _ws_sio.emit("FETCH_TRADES_CS_PRO",
+                         {"event": "subscribe", "pair": pair},
+                         namespace=WS_NAMESPACE)
+            if symbol not in state["ws_subscribed"]:
+                state["ws_subscribed"].append(symbol)
+            log(f"📡 WS subscribed: {symbol}", "WS")
+    except Exception as e:
+        log(f"WS subscribe error {symbol}: {e}", "ERR")
+
+def ws_unsubscribe(symbol):
+    """Unsubscribe from live trades for a symbol."""
+    global _ws_sio
+    pair = symbol.replace("/", ",")
+    try:
+        if _ws_sio and _ws_sio.connected:
+            _ws_sio.emit("FETCH_TRADES_CS_PRO",
+                         {"event": "unsubscribe", "pair": pair},
+                         namespace=WS_NAMESPACE)
+            if symbol in state["ws_subscribed"]:
+                state["ws_subscribed"].remove(symbol)
+            log(f"📡 WS unsubscribed: {symbol}", "WS")
+    except Exception as e:
+        log(f"WS unsubscribe error {symbol}: {e}", "ERR")
+
+def ws_connect():
+    """Connect to CoinSwitch WebSocket and maintain connection."""
+    global _ws_sio
+    def _run():
+        global _ws_sio
+        while state["running"]:
+            try:
+                _ws_sio = sio_client.Client(reconnection=True, reconnection_attempts=10,
+                                            reconnection_delay=3, logger=False,
+                                            engineio_logger=False)
+
+                @_ws_sio.event(namespace=WS_NAMESPACE)
+                def connect():
+                    state["ws_connected"] = True
+                    log("⚡ WebSocket CONNECTED — realtime prices active", "WS")
+                    # Re-subscribe if we had an active trade
+                    if state["in_trade"] and state["trade_sym"]:
+                        ws_subscribe(state["trade_sym"])
+
+                @_ws_sio.event(namespace=WS_NAMESPACE)
+                def disconnect():
+                    state["ws_connected"] = False
+                    log("⚠️ WebSocket disconnected — reconnecting...", "WS")
+
+                @_ws_sio.on("FETCH_TRADES_CS_PRO", namespace=WS_NAMESPACE)
+                def on_trade(data):
+                    _ws_on_trade(data)
+
+                _ws_sio.connect(
+                    WS_BASE_URL,
+                    namespaces=[WS_NAMESPACE],
+                    socketio_path=WS_SOCKET_PATH,
+                    transports=["websocket"],
+                    wait_timeout=10,
+                )
+                _ws_sio.wait()
+            except Exception as e:
+                state["ws_connected"] = False
+                log(f"WS connection error: {e} — retry in 5s", "ERR")
+                time.sleep(5)
+
+    threading.Thread(target=_run, daemon=True, name="ws-thread").start()
+    log("🔌 WebSocket thread started", "WS")
+
+def ws_disconnect():
+    """Gracefully disconnect WebSocket."""
+    global _ws_sio
+    try:
+        if _ws_sio:
+            _ws_sio.disconnect()
+    except:
+        pass
+    state["ws_connected"] = False
+    state["ws_subscribed"] = []
 
 def validate_keys():
     try:
@@ -193,7 +382,7 @@ def fetch_exchange_precision(symbol):
     return {"base": 4, "quote": 2, "limit": 0}
 
 def fetch_trade_info(symbol):
-    """GET /trade/api/v2/tradeInfo — real min/max INR order size from CoinSwitch docs."""
+    """GET /trade/api/v2/tradeInfo — real min/max INR order size per CoinSwitch docs."""
     cache_key = f"tinfo_{symbol}"
     if cache_key in state["precision_cache"]:
         return state["precision_cache"][cache_key]
@@ -424,13 +613,13 @@ def sensei_analyze(closes, volumes, highs, lows):
     obv_now  = calc_obv(closes, volumes)
     obv_prev = calc_obv(closes[:-5], volumes[:-5])
 
-    # Tightened signal conditions for higher win rate
-    c1 = ef9[-1]>ef21[-1] and ef21[-1]>ef50[-1] and price>ef9[-1]  # full EMA alignment only
-    c2 = mh > 0 and mh > mh_prev and ml > ms and ml > 0            # MACD must be positive
-    c3 = 40 <= rsi_v <= 65                                          # tighter RSI zone
-    c4 = volumes[-1] > avg_vol * 1.2 and obv_now > obv_prev         # stronger volume surge
-    c5 = price > vwap_v and price <= bb_up * 0.995                  # above VWAP, below BB top
-    c6 = k > d and k < 70 and wr > -60 and wr < -15                # stoch+WR tighter zone
+    # Tightened for higher win rate — all conditions stricter
+    c1 = ef9[-1]>ef21[-1] and ef21[-1]>ef50[-1] and price>ef9[-1]   # full EMA stack only
+    c2 = mh > 0 and mh > mh_prev and ml > ms and ml > 0             # MACD positive + rising
+    c3 = 40 <= rsi_v <= 65                                           # tighter RSI zone
+    c4 = volumes[-1] > avg_vol * 1.2 and obv_now > obv_prev          # strong volume surge
+    c5 = price > vwap_v and price <= bb_up * 0.995                   # above VWAP, not overbought
+    c6 = k > d and k < 70 and wr > -60 and wr < -15                 # stoch+WR confirmation
 
     signals = {
         "Trend EMA (9>21>50)":     c1,
@@ -455,11 +644,11 @@ def sensei_analyze(closes, volumes, highs, lows):
     return score, signals, confidence, atr_v, price
 
 def calc_position_size(capital, entry, sl_price, score):
-    risk_amount  = capital * 0.015           # risk 1.5% per trade (down from 2%)
+    risk_amount  = capital * 0.015            # 1.5% risk per trade
     price_risk   = max(entry - sl_price, entry * 0.001)
     raw_position = (risk_amount / price_risk) * entry
-    mult = {6:1.0, 5:0.90}.get(score, 0.75)  # only 5 or 6 signal trades now
-    pos  = max(MIN_ORDER_INR, min(raw_position * mult, capital * 0.60))  # max 60% capital
+    mult = {6:1.0, 5:0.90}.get(score, 0.75)  # only 5 or 6 signal trades
+    pos  = max(MIN_ORDER_INR, min(raw_position * mult, capital * 0.60))
     return round(pos, 2)
 
 def market_regime(c, h, l):
@@ -569,6 +758,7 @@ def api_state():
         "signals_detail": state["signals_detail"],
         "best_coin":      state["best_coin"],
         "daily_loss_pct": round(daily_loss_pct(), 1),
+        "ws_connected":   state["ws_connected"],
         "wallet": {
             "inr_balance":   round(state["wallet"]["inr_balance"], 2),
             "inr_locked":    round(state["wallet"]["inr_locked"], 2),
@@ -646,6 +836,7 @@ def api_start():
         time.sleep(0.2)
         fetch_wallet()
     threading.Thread(target=startup, daemon=True).start()
+    ws_connect()   # Start realtime WebSocket connection
     return jsonify({"ok": True})
 
 @app.route("/api/stop", methods=["POST"])
@@ -653,6 +844,7 @@ def api_start():
 def api_stop():
     state["running"] = False
     state["sensei_mood"] = "RESTING"
+    ws_disconnect()
     log(f"🏁 Session ended | P&L: ₹{state['total_pnl']:.2f} | WR: {win_rate():.1f}%", "STOP")
     return jsonify({"ok": True})
 
@@ -710,29 +902,7 @@ def api_candles():
         elif lpnl > 0 and rsi_now > 70:  reason = "PROFIT_PROTECT"
 
         if reason:
-            # Step 1: Cancel open BUY if still unfilled (prevents double position)
-            open_oid = state.get("open_order_id")
-            if open_oid:
-                buy_status = get_order_status(open_oid)
-                log(f"🔍 BUY order status: {buy_status}", "ORDER")
-                if buy_status in ("OPEN", "PARTIALLY_EXECUTED", "CANCELLATION_RAISED"):
-                    log("⚠️ Cancelling unfilled BUY before SELL...", "ORDER")
-                    cancel_order(open_oid)
-                    time.sleep(1)
-
-            # Step 2: SELL with 3 retries — stop loss MUST execute
-            sell_code, sell_result = 0, {}
-            for attempt in range(3):
-                sell_code, sell_result = place_order(sym, "SELL", pos, price)
-                if sell_code == 200:
-                    break
-                log(f"⚠️ SELL attempt {attempt+1} failed [{sell_code}] — retrying in 2s", "WARN")
-                time.sleep(2)
-
-            if sell_code != 200:
-                log(f"❌ SELL failed after 3 attempts — will retry next scan", "ERR")
-                return jsonify({"action": "sell_failed"})
-
+            code, result = place_order(sym, "SELL", pos, price)
             pnl = round((price - state["entry_price"]) / state["entry_price"] * pos, 2)
             state["total_pnl"]    += pnl
             state["daily_pnl"]    += pnl
@@ -747,13 +917,12 @@ def api_candles():
             })
             entry_was = state["entry_price"]
             sigs = state["signals_detail"].copy()
-            # Full reset — next trade only AFTER wallet confirmed
             state.update({"in_trade": False, "trade_sym": None, "live_pnl": 0.0,
                           "peak_price": 0.0, "trail_sl": 0.0, "sensei_mood": "PATIENT",
-                          "open_order_id": None, "position_size": 0.0})
+                          "open_order_id": None})
             log(f"{'💰 WIN' if pnl>=0 else '🛑 LOSS'} {sym} ₹{pnl:+.2f} | Total ₹{state['total_pnl']:.2f} | WR {win_rate():.1f}%",
                 "WIN" if pnl>=0 else "LOSS")
-            fetch_wallet()  # blocking — wallet synced before next trade
+            threading.Thread(target=fetch_wallet, daemon=True).start()
             threading.Thread(target=send_alert, args=(sym,entry_was,price,pnl,reason,sigs), daemon=True).start()
         return jsonify({"action": "monitoring"})
 
@@ -799,11 +968,11 @@ def api_candles():
         from collections import Counter
         state["market_regime"] = Counter(regimes).most_common(1)[0][0]
 
-    # Only trade in TRENDING market — avoid RANGING and VOLATILE
+    # Only trade in TRENDING market — skip RANGING and VOLATILE
     regime_ok = state["market_regime"] in ("TRENDING", "UNKNOWN")
     if not regime_ok:
         state["sensei_mood"] = "PATIENT"
-        log(f"⏸ Market is {state['market_regime']} — waiting for trend. No trade.", "WAIT")
+        log(f"⏸ Market is {state['market_regime']} — waiting for trend", "WAIT")
         return jsonify({"action": "no_trend"})
 
     if best["score"] >= min_s and best["sym"]:
@@ -828,6 +997,7 @@ def api_candles():
                 "sensei_mood": "IN_TRADE",
             })
             log(f"✅ BUY filled | TP ₹{best['tp']:.6f} | SL ₹{best['sl']:.6f}", "TRADE")
+            ws_subscribe(sym)   # Start realtime price monitoring for this symbol
         else:
             log(f"❌ Order failed [{code}]: {result}", "ERR")
             state["sensei_mood"] = "PATIENT"
