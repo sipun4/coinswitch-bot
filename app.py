@@ -42,6 +42,24 @@ ALL_PAIRS = [
     "BNB/INR","ADA/INR","MATIC/INR","LTC/INR",
     "LINK/INR","DOT/INR","SOL/INR","AVAX/INR",
 ]
+
+# CoinSwitch exchange routing per coin (from /trade/api/v2/coins docs)
+# wazirx supports INR pairs, coinswitchx supports more coins
+COIN_EXCHANGE = {
+    "DOGE/INR":  "coinswitchx",
+    "XRP/INR":   "coinswitchx",
+    "TRX/INR":   "coinswitchx",
+    "SHIB/INR":  "coinswitchx",
+    "BNB/INR":   "coinswitchx",
+    "ADA/INR":   "coinswitchx",
+    "MATIC/INR": "coinswitchx",
+    "LTC/INR":   "coinswitchx",
+    "LINK/INR":  "coinswitchx",
+    "DOT/INR":   "coinswitchx",
+    "SOL/INR":   "coinswitchx",
+    "AVAX/INR":  "coinswitchx",
+}
+# Will be auto-updated by discover_exchanges() on startup
 BINANCE_MAP = {
     "DOGE/INR":"DOGEUSDT","XRP/INR":"XRPUSDT","TRX/INR":"TRXUSDT",
     "SHIB/INR":"SHIBUSDT","BNB/INR":"BNBUSDT","ADA/INR":"ADAUSDT",
@@ -468,15 +486,20 @@ def place_order(symbol, side, amount_inr, price):
     else:
         qty = round(raw_qty, 4)
 
-    # CoinSwitch requires price and quantity as numbers (not strings)
+    # Get the correct exchange for this symbol
+    exchange = COIN_EXCHANGE.get(symbol, "coinswitchx")
+
+    # CoinSwitch requires: symbol, side, type, price, quantity, exchange
     payload = {
         "symbol":   sym,
         "side":     side.lower(),
         "type":     "limit",
         "price":    float(round(order_price, 8)),
-        "quantity": float(round(qty, 4)),
+        "quantity": float(round(qty, 0) if qty >= 100 else round(qty, 4)),
+        "exchange": exchange,
     }
     body = json.dumps(payload, separators=(',', ':'))
+    log(f"Order payload: {body}", "ORDER")
 
     try:
         headers = make_headers("POST", ep)
@@ -599,6 +622,29 @@ def get_precision(symbol):
         log(f"Precision fetch error: {e}", "ERR")
     return {}
 
+def discover_exchanges():
+    """
+    Fetch which exchange supports each coin from CoinSwitch API.
+    Updates COIN_EXCHANGE dict automatically.
+    """
+    global COIN_EXCHANGE
+    exchanges_to_check = ["coinswitchx", "wazirx"]
+    for exchange in exchanges_to_check:
+        try:
+            ep = f"/trade/api/v2/coins?exchange={exchange}"
+            headers = make_headers("GET", ep)
+            r = requests.get(BASE_URL + ep, headers=headers, timeout=10)
+            data = r.json()
+            coins = data.get("data", {}).get(exchange, [])
+            for coin in coins:
+                coin_upper = coin.upper()
+                if coin_upper in ALL_PAIRS and coin_upper not in COIN_EXCHANGE:
+                    COIN_EXCHANGE[coin_upper] = exchange
+            log(f"Exchange {exchange}: {len(coins)} coins available", "INFO")
+        except Exception as e:
+            log(f"Exchange discovery error for {exchange}: {e}", "ERR")
+    log(f"Exchange mapping: {COIN_EXCHANGE}", "INFO")
+
 def validate_keys():
     """Test if API keys work."""
     ep = "/trade/api/v2/validate/keys"
@@ -709,7 +755,9 @@ def api_start():
         ok, resp = validate_keys()
         if ok:
             log("✅ API keys validated — real trading ACTIVE on CoinSwitch PRO", "START")
-            time.sleep(0.5)
+            time.sleep(0.3)
+            discover_exchanges()     # Find correct exchange per coin
+            time.sleep(0.3)
             fetch_wallet_balance()   # Load real wallet immediately
         else:
             log(f"❌ API key validation failed: {resp} — check Render env vars", "ERR")
