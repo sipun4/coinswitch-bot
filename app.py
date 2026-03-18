@@ -476,15 +476,22 @@ def place_order(symbol, side, amount_inr, price):
         order_price = round(price, 8)
         log(f"Using Binance fallback price: ₹{order_price}", "ORDER")
 
-    # Calculate quantity — for micro-priced coins (SHIB etc) use less decimals
+    # Enforce CoinSwitch minimum order size (₹80 for safety margin above ₹50 min)
+    MIN_ORDER_INR = 80.0
+    if amount_inr < MIN_ORDER_INR:
+        log(f"⚠️ Raising order from ₹{amount_inr} to minimum ₹{MIN_ORDER_INR}", "WARN")
+        amount_inr = MIN_ORDER_INR
+
+    # Calculate quantity with correct precision
     raw_qty = amount_inr / order_price
-    # Use 0 decimal places for large quantities (>1000 units), 4 for small
-    if raw_qty >= 1000:
-        qty = round(raw_qty, 0)
-    elif raw_qty >= 10:
-        qty = round(raw_qty, 2)
+    if raw_qty >= 10000:
+        qty = round(raw_qty, 0)      # SHIB: 87912 → 87912
+    elif raw_qty >= 100:
+        qty = round(raw_qty, 1)      # ADA: 2.97 → round to 1dp
+    elif raw_qty >= 1:
+        qty = round(raw_qty, 4)      # BTC: 0.0012
     else:
-        qty = round(raw_qty, 4)
+        qty = round(raw_qty, 6)      # Very expensive coins
 
     # Get the correct exchange for this symbol
     exchange = COIN_EXCHANGE.get(symbol, "coinswitchx")
@@ -495,7 +502,7 @@ def place_order(symbol, side, amount_inr, price):
         "side":     side.lower(),
         "type":     "limit",
         "price":    float(round(order_price, 8)),
-        "quantity": float(round(qty, 0) if qty >= 100 else round(qty, 4)),
+        "quantity": float(qty),
         "exchange": exchange,
     }
     body = json.dumps(payload, separators=(',', ':'))
@@ -742,12 +749,25 @@ def api_state():
 def api_start():
     d   = request.json or {}
     cap = float(d.get("capital", CAPITAL))
+
+    # Dynamic per-trade sizing to always meet CoinSwitch ₹50 minimum
+    if cap <= 150:
+        per_trade = max(80.0, cap * 0.85)   # ₹100 → ₹85
+    elif cap <= 300:
+        per_trade = max(80.0, cap * 0.60)   # ₹200 → ₹120
+    elif cap <= 600:
+        per_trade = max(80.0, cap * 0.45)   # ₹500 → ₹225
+    else:
+        per_trade = max(80.0, cap * 0.30)   # ₹1000+ → 30%
+
+    per_trade = round(per_trade, 2)
     state.update({
         "running":True,"capital":cap,"current":cap,"wins":0,"losses":0,
         "total_pnl":0.0,"daily_pnl":0.0,"daily_trades":0,"in_trade":False,
         "sensei_mood":"PATIENT","session_start":datetime.now().strftime("%H:%M"),
+        "per_trade": per_trade,
     })
-    log("🎌 SENSEI awakens. Capital ₹"+str(cap)+" | Risk per trade: 2% = ₹"+str(round(cap*0.02)), "START")
+    log(f"🎌 SENSEI awakens. Capital ₹{cap} | Per trade: ₹{per_trade} | Min order ₹80 ✅", "START")
     log("📋 Rules: 4/6 signals needed | ATR-based TP/SL | Trailing stop active", "INFO")
     # Validate API keys on startup
     def check_keys_and_wallet():
