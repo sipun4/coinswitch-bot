@@ -271,7 +271,7 @@ tr:hover td{background:rgba(24,255,255,.015)}
   <div class="ctrl">
     <div class="pt">⚙ Sensei Configuration</div>
     <div class="irow">
-      <div class="ig"><label>Capital (₹)</label><input type="number" id="cap-in" value="300" min="100" max="100000"></div>
+      <div class="ig"><label>Capital (₹)</label><input type="number" id="cap-in" value="200" min="100" max="100000"></div>
       <div class="ig"><label>Min Signals (of 6)</label>
         <select id="sig-in">
           <option value="3">3/6 — Active trading</option>
@@ -284,9 +284,9 @@ tr:hover td{background:rgba(24,255,255,.015)}
     <div class="irow">
       <div class="ig"><label>Scan Interval</label>
         <select id="interval-in">
+          <option value="10" selected>10 seconds</option>
           <option value="30">30 seconds</option>
-          <option value="60" selected>60 seconds</option>
-          <option value="120">2 minutes</option>
+          <option value="60">60 seconds</option>
         </select>
       </div>
       <div class="ig"><label>Alert Email</label><input placeholder="Set ALERT_EMAIL on Render" readonly style="opacity:.5;cursor:not-allowed"></div>

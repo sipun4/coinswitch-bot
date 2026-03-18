@@ -56,14 +56,14 @@ DESIRED_PAIRS = [
 SYMBOL_EXCHANGE_MAP = {}
 ALL_PAIRS = list(DESIRED_PAIRS)  # Active pairs (filtered to available ones)
 
-# Strategy settings
-ATR_TP_MULT        = 2.0
-ATR_SL_MULT        = 1.0
-MIN_REWARD_RISK    = 1.5
-SENSEI_MIN_SIGNALS = 4
-MAX_DAILY_TRADES   = 12
-MAX_DAILY_LOSS_PCT = 0.06
-MIN_ORDER_INR      = 100.0   # Safe buffer above CoinSwitch ₹50 minimum
+# Strategy settings — tuned for maximum win rate
+ATR_TP_MULT        = 3.0   # TP at 3x ATR — bigger target, let winners run
+ATR_SL_MULT        = 0.8   # SL at 0.8x ATR — tight stop, cut losses fast
+MIN_REWARD_RISK    = 2.5   # Only trade if reward >= 2.5x risk
+SENSEI_MIN_SIGNALS = 5     # Require 5/6 signals — high-confidence only
+MAX_DAILY_TRADES   = 6     # Fewer, higher-quality trades
+MAX_DAILY_LOSS_PCT = 0.04  # Stop day at 4% loss — protect capital
+MIN_ORDER_INR      = 100.0 # Safe buffer above CoinSwitch ₹50 minimum
 
 # ══════════════════════════════════════════════════════════
 #  STATE
@@ -149,10 +149,9 @@ def cs_post(endpoint, payload):
     return r.status_code, r.json()
 
 def cs_delete(endpoint, payload):
-    """Authenticated DELETE request — signature includes sorted payload per docs."""
-    epoch_time = str(int(time.time() * 1000))
-    body_str   = json.dumps(payload, separators=(',', ':'), sort_keys=True)
-    sig_msg    = "DELETE" + endpoint + body_str
+    """Authenticated DELETE — docs: signature = method + endpoint + epoch_time (NOT body)."""
+    epoch_time  = str(int(time.time() * 1000))
+    sig_msg     = "DELETE" + endpoint + epoch_time
     private_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(CS_SECRET_KEY))
     signature   = private_key.sign(bytes(sig_msg, 'utf-8')).hex()
     headers = {
@@ -192,6 +191,25 @@ def fetch_exchange_precision(symbol):
     except Exception as e:
         log(f"Precision fetch error: {e}", "ERR")
     return {"base": 4, "quote": 2, "limit": 0}
+
+def fetch_trade_info(symbol):
+    """GET /trade/api/v2/tradeInfo — real min/max INR order size from CoinSwitch docs."""
+    cache_key = f"tinfo_{symbol}"
+    if cache_key in state["precision_cache"]:
+        return state["precision_cache"][cache_key]
+    try:
+        sym_exch = SYMBOL_EXCHANGE_MAP.get(symbol, EXCHANGE)
+        code, data = cs_get("/trade/api/v2/tradeInfo", {"exchange": sym_exch, "symbol": symbol})
+        if code == 200:
+            info = data.get("data", {}).get(sym_exch, {}).get(symbol, {})
+            if info:
+                min_order = float(info.get("quote", {}).get("min", MIN_ORDER_INR))
+                result = {"min_order": max(min_order, MIN_ORDER_INR)}
+                state["precision_cache"][cache_key] = result
+                return result
+    except Exception as e:
+        log(f"TradeInfo error {symbol}: {e}", "ERR")
+    return {"min_order": MIN_ORDER_INR}
 
 def fetch_depth(symbol):
     """
@@ -276,11 +294,12 @@ def place_order(symbol, side, amount_inr, fallback_price):
     raw_qty     = amount_inr / order_price
     quantity    = round(raw_qty, base_prec)
 
-    # Step 4: Enforce minimum order size
-    if amount_inr < MIN_ORDER_INR:
-        log(f"⚠️ Raising ₹{amount_inr} → ₹{MIN_ORDER_INR} (minimum)", "WARN")
-        amount_inr  = MIN_ORDER_INR
-        quantity    = round(amount_inr / order_price, base_prec)
+    # Step 4: Enforce real minimum from CoinSwitch tradeInfo API
+    real_min = fetch_trade_info(symbol).get("min_order", MIN_ORDER_INR)
+    if amount_inr < real_min:
+        log(f"⚠️ Raising ₹{amount_inr} → ₹{real_min} (CoinSwitch min)", "WARN")
+        amount_inr = real_min
+        quantity   = round(amount_inr / order_price, base_prec)
 
     # Step 5: Get correct exchange FIRST, then build payload
     symbol_exchange = SYMBOL_EXCHANGE_MAP.get(symbol, EXCHANGE)
@@ -405,12 +424,13 @@ def sensei_analyze(closes, volumes, highs, lows):
     obv_now  = calc_obv(closes, volumes)
     obv_prev = calc_obv(closes[:-5], volumes[:-5])
 
-    c1 = (ef9[-2]<ef21[-2] and ef9[-1]>ef21[-1]) or (ef9[-1]>ef21[-1] and ef21[-1]>ef50[-1] and price>ef9[-1])
-    c2 = mh > 0 and mh > mh_prev and ml > ms
-    c3 = (38 <= rsi_v <= 62) or (rsi_v > 30 and calc_rsi(closes[:-3]) <= 30)
-    c4 = volumes[-1] > avg_vol * 1.08 and obv_now > obv_prev
-    c5 = price > vwap_v or (price <= bb_lo * 1.012)
-    c6 = k > d and k < 75 and (-80 < wr < -20)
+    # Tightened signal conditions for higher win rate
+    c1 = ef9[-1]>ef21[-1] and ef21[-1]>ef50[-1] and price>ef9[-1]  # full EMA alignment only
+    c2 = mh > 0 and mh > mh_prev and ml > ms and ml > 0            # MACD must be positive
+    c3 = 40 <= rsi_v <= 65                                          # tighter RSI zone
+    c4 = volumes[-1] > avg_vol * 1.2 and obv_now > obv_prev         # stronger volume surge
+    c5 = price > vwap_v and price <= bb_up * 0.995                  # above VWAP, below BB top
+    c6 = k > d and k < 70 and wr > -60 and wr < -15                # stoch+WR tighter zone
 
     signals = {
         "Trend EMA (9>21>50)":     c1,
@@ -435,11 +455,11 @@ def sensei_analyze(closes, volumes, highs, lows):
     return score, signals, confidence, atr_v, price
 
 def calc_position_size(capital, entry, sl_price, score):
-    risk_amount  = capital * 0.02
+    risk_amount  = capital * 0.015           # risk 1.5% per trade (down from 2%)
     price_risk   = max(entry - sl_price, entry * 0.001)
     raw_position = (risk_amount / price_risk) * entry
-    mult = {6:1.0, 5:0.85, 4:0.70}.get(score, 0.55)
-    pos  = max(MIN_ORDER_INR, min(raw_position * mult, capital * 0.80))
+    mult = {6:1.0, 5:0.90}.get(score, 0.75)  # only 5 or 6 signal trades now
+    pos  = max(MIN_ORDER_INR, min(raw_position * mult, capital * 0.60))  # max 60% capital
     return round(pos, 2)
 
 def market_regime(c, h, l):
@@ -690,7 +710,29 @@ def api_candles():
         elif lpnl > 0 and rsi_now > 70:  reason = "PROFIT_PROTECT"
 
         if reason:
-            code, result = place_order(sym, "SELL", pos, price)
+            # Step 1: Cancel open BUY if still unfilled (prevents double position)
+            open_oid = state.get("open_order_id")
+            if open_oid:
+                buy_status = get_order_status(open_oid)
+                log(f"🔍 BUY order status: {buy_status}", "ORDER")
+                if buy_status in ("OPEN", "PARTIALLY_EXECUTED", "CANCELLATION_RAISED"):
+                    log("⚠️ Cancelling unfilled BUY before SELL...", "ORDER")
+                    cancel_order(open_oid)
+                    time.sleep(1)
+
+            # Step 2: SELL with 3 retries — stop loss MUST execute
+            sell_code, sell_result = 0, {}
+            for attempt in range(3):
+                sell_code, sell_result = place_order(sym, "SELL", pos, price)
+                if sell_code == 200:
+                    break
+                log(f"⚠️ SELL attempt {attempt+1} failed [{sell_code}] — retrying in 2s", "WARN")
+                time.sleep(2)
+
+            if sell_code != 200:
+                log(f"❌ SELL failed after 3 attempts — will retry next scan", "ERR")
+                return jsonify({"action": "sell_failed"})
+
             pnl = round((price - state["entry_price"]) / state["entry_price"] * pos, 2)
             state["total_pnl"]    += pnl
             state["daily_pnl"]    += pnl
@@ -705,12 +747,13 @@ def api_candles():
             })
             entry_was = state["entry_price"]
             sigs = state["signals_detail"].copy()
+            # Full reset — next trade only AFTER wallet confirmed
             state.update({"in_trade": False, "trade_sym": None, "live_pnl": 0.0,
                           "peak_price": 0.0, "trail_sl": 0.0, "sensei_mood": "PATIENT",
-                          "open_order_id": None})
+                          "open_order_id": None, "position_size": 0.0})
             log(f"{'💰 WIN' if pnl>=0 else '🛑 LOSS'} {sym} ₹{pnl:+.2f} | Total ₹{state['total_pnl']:.2f} | WR {win_rate():.1f}%",
                 "WIN" if pnl>=0 else "LOSS")
-            threading.Thread(target=fetch_wallet, daemon=True).start()
+            fetch_wallet()  # blocking — wallet synced before next trade
             threading.Thread(target=send_alert, args=(sym,entry_was,price,pnl,reason,sigs), daemon=True).start()
         return jsonify({"action": "monitoring"})
 
@@ -755,6 +798,13 @@ def api_candles():
     if regimes:
         from collections import Counter
         state["market_regime"] = Counter(regimes).most_common(1)[0][0]
+
+    # Only trade in TRENDING market — avoid RANGING and VOLATILE
+    regime_ok = state["market_regime"] in ("TRENDING", "UNKNOWN")
+    if not regime_ok:
+        state["sensei_mood"] = "PATIENT"
+        log(f"⏸ Market is {state['market_regime']} — waiting for trend. No trade.", "WAIT")
+        return jsonify({"action": "no_trend"})
 
     if best["score"] >= min_s and best["sym"]:
         sym   = best["sym"]
