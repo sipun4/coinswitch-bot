@@ -24,12 +24,12 @@ CAPITAL       = float(os.environ.get("CAPITAL", "300"))
 
 BASE_URL      = "https://coinswitch.co"
 ALL_PAIRS     = ["DOGE/INR", "XRP/INR", "TRX/INR", "SHIB/INR"]
-# CryptoCompare symbol map (works on all cloud hosts, free, no API key needed)
-CC_MAP = {
-    "DOGE/INR": ("DOGE", "INR"),
-    "XRP/INR":  ("XRP",  "INR"),
-    "TRX/INR":  ("TRX",  "INR"),
-    "SHIB/INR": ("SHIB", "INR"),
+# Yahoo Finance symbols — works on virtually all servers, no API key needed
+YF_MAP = {
+    "DOGE/INR": "DOGE-INR",
+    "XRP/INR":  "XRP-INR",
+    "TRX/INR":  "TRX-INR",
+    "SHIB/INR": "SHIB-INR",
 }
 
 TAKE_PROFIT_PCT = 0.006
@@ -171,51 +171,49 @@ def win_rate():
 # ════════════════════════════════════════════════════
 def fetch_candles(symbol, limit=60):
     """
-    Fetch 1-minute OHLCV candles from CryptoCompare (free, no API key, works everywhere).
+    Fetch 1-minute OHLCV candles from Yahoo Finance.
+    Yahoo Finance works on virtually all servers with no API key.
     Returns (closes, volumes, highs, lows) in INR.
     """
-    pair = CC_MAP.get(symbol)
-    if not pair:
+    yf_sym = YF_MAP.get(symbol)
+    if not yf_sym:
         raise ValueError(f"Unknown symbol: {symbol}")
-    fsym, tsym = pair
 
-    # Primary: CryptoCompare histominute
-    url = "https://min-api.cryptocompare.com/data/v2/histominute"
-    params = {"fsym": fsym, "tsym": tsym, "limit": limit, "aggregate": 1}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+
+    # Yahoo Finance v8 chart API — 1m candles, last 1 hour
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}"
+    params = {
+        "interval":  "1m",
+        "range":     "1h",
+        "includePrePost": "false",
+    }
     try:
-        r   = requests.get(url, params=params, timeout=12,
-                           headers={"User-Agent": "CoinSwitchBot/1.0"})
-        d   = r.json()
-        raw = d.get("Data", {}).get("Data", [])
-        if len(raw) >= 30:
-            closes  = [float(c["close"])       for c in raw]
-            volumes = [float(c["volumefrom"])   for c in raw]
-            highs   = [float(c["high"])         for c in raw]
-            lows    = [float(c["low"])           for c in raw]
-            return closes, volumes, highs, lows
-    except Exception as e:
-        log(f"CryptoCompare error: {e}")
+        r    = requests.get(url, params=params, headers=headers, timeout=15)
+        data = r.json()
+        result = data["chart"]["result"][0]
+        closes  = result["indicators"]["quote"][0]["close"]
+        highs   = result["indicators"]["quote"][0]["high"]
+        lows    = result["indicators"]["quote"][0]["low"]
+        volumes = result["indicators"]["quote"][0]["volume"]
 
-    # Fallback: CoinGecko simple price (no candles, simulate with noise for indicators)
-    try:
-        cg_ids = {"DOGE":"dogecoin","XRP":"ripple","TRX":"tron","SHIB":"shiba-inu"}
-        cg_id  = cg_ids.get(fsym)
-        r2 = requests.get(
-            f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart",
-            params={"vs_currency": "inr", "days": "1", "interval": "minute"},
-            timeout=12, headers={"User-Agent": "CoinSwitchBot/1.0"})
-        prices = r2.json().get("prices", [])
-        vols   = r2.json().get("total_volumes", [])
-        if len(prices) >= 30:
-            closes  = [p[1] for p in prices[-limit:]]
-            volumes = [v[1] for v in vols[-limit:]]
-            highs   = [p * 1.001 for p in closes]
-            lows    = [p * 0.999 for p in closes]
-            return closes, volumes, highs, lows
-    except Exception as e:
-        log(f"CoinGecko fallback error: {e}")
+        # Clean out None values (Yahoo sometimes returns nulls)
+        cleaned = [(c, h, l, v) for c, h, l, v in zip(closes, highs, lows, volumes)
+                   if c is not None and h is not None and l is not None and v is not None]
+        if len(cleaned) < 20:
+            raise ValueError(f"Not enough clean candles: {len(cleaned)}")
 
-    raise ValueError(f"All data sources failed for {symbol}")
+        closes  = [x[0] for x in cleaned]
+        highs   = [x[1] for x in cleaned]
+        lows    = [x[2] for x in cleaned]
+        volumes = [x[3] for x in cleaned]
+        return closes[-limit:], volumes[-limit:], highs[-limit:], lows[-limit:]
+
+    except Exception as e:
+        raise ValueError(f"Yahoo Finance failed for {yf_sym}: {e}")
 
 
 # ════════════════════════════════════════════════════
