@@ -42,17 +42,17 @@ BASE_URL      = "https://coinswitch.co"
 EXCHANGE      = "coinswitchx"   # Default exchange
 EXCHANGES     = ["coinswitchx", "wazirx"]  # All supported exchanges
 
-# Desired pairs — bot auto-discovers which are available on coinswitchx
-# MATIC was rebranded to POL in Sept 2024
+# Confirmed coinswitchx coins (verified from /api/test_symbol)
+# MATIC does NOT exist — removed permanently
 DESIRED_PAIRS = [
     "DOGE/INR", "XRP/INR",  "TRX/INR",  "SHIB/INR",
-    "BNB/INR",  "ADA/INR",  "POL/INR",  "LTC/INR",
-    "LINK/INR", "DOT/INR",  "SOL/INR",  "AVAX/INR",
-    "BTC/INR",  "ETH/INR",  "PEPE/INR", "WIF/INR",
-    "SUI/INR",  "TON/INR",  "APT/INR",  "NEAR/INR",
+    "BNB/INR",  "ADA/INR",  "LTC/INR",  "LINK/INR",
+    "DOT/INR",  "SOL/INR",  "AVAX/INR", "BTC/INR",
+    "ETH/INR",  "PEPE/INR", "WIF/INR",  "SUI/INR",
+    "TON/INR",  "APT/INR",  "NEAR/INR", "POL/INR",
 ]
 # Will be populated by discover_exchange_map() on startup
-# Maps symbol -> exchange: {"MATIC/INR": "wazirx", "DOGE/INR": "coinswitchx", ...}
+# Maps symbol -> exchange: {"DOT/INR": "coinswitchx", "DOGE/INR": "coinswitchx", ...}
 SYMBOL_EXCHANGE_MAP = {}
 ALL_PAIRS = list(DESIRED_PAIRS)  # Active pairs (filtered to available ones)
 
@@ -80,6 +80,7 @@ state = {
     "sensei_mood": "PATIENT", "market_regime": "UNKNOWN",
     "signals_detail": {}, "best_coin": None,
     "session_start": None,
+    "exchange_map_ready": False,   # Don't trade until map is built
     "wallet": {
         "inr_balance": 0.0, "inr_locked": 0.0, "total_value": 0.0,
         "holdings": {}, "last_updated": "—",
@@ -572,7 +573,7 @@ def api_start():
         "daily_trades": 0, "in_trade": False, "per_trade": per_trade,
         "sensei_mood": "PATIENT", "session_start": datetime.now().strftime("%H:%M"),
     })
-    log(f"🎌 SENSEI v5 awakens | Capital ₹{cap} | Per trade ₹{per_trade} | Exchange: {EXCHANGE}", "START")
+    log(f"🎌 SENSEI v5.3 awakens | Capital ₹{cap} | Per trade ₹{per_trade} | NO MATIC | Exchange: {EXCHANGE}", "START")
     log(f"📋 Signal threshold: {SENSEI_MIN_SIGNALS}/6 | Min order: ₹{MIN_ORDER_INR} | Max daily loss: {MAX_DAILY_LOSS_PCT*100:.0f}%", "INFO")
 
     def startup():
@@ -610,8 +611,9 @@ def api_start():
             tradeable = cs_coins[:12]
             log(f"⚠️ None of desired pairs found — using top {len(tradeable)} from coinswitchx", "WARN")
 
-        ALL_PAIRS[:] = tradeable   # in-place update so module-level var changes
-        log(f"✅ Exchange map: {len(sym_map)} coins available", "INFO")
+        ALL_PAIRS[:] = tradeable
+        state["exchange_map_ready"] = True
+        log(f"✅ Exchange map ready — {len(sym_map)} coins, trading {len(ALL_PAIRS)} pairs", "INFO")
         log(f"✅ Trading {len(ALL_PAIRS)} pairs: {', '.join(ALL_PAIRS)}", "INFO")
 
         # Show which desired pairs exist and which don't
@@ -713,6 +715,11 @@ def api_candles():
         return jsonify({"action": "monitoring"})
 
     # ── SCAN: find best trade ───────────────────────────────
+    # Block trading until exchange map is built
+    if not state.get("exchange_map_ready", False):
+        log("⏳ Waiting for exchange map to load... (30s after start)", "INFO")
+        return jsonify({"action": "initializing"})
+
     state["sensei_mood"] = "HUNTING"
     log(f"🔍 Scanning {len(all_c)} coins...", "SCAN")
     scores = {}
