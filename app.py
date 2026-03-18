@@ -736,6 +736,54 @@ def api_wallet_refresh():
     threading.Thread(target=fetch_wallet, daemon=True).start()
     return jsonify({"ok": True})
 
+@app.route("/api/test_symbol")
+@login_required  
+def api_test_symbol():
+    """
+    Try every possible symbol format with a tiny test order (₹0 qty)
+    to find which format CoinSwitch actually accepts.
+    Visit: your-url/api/test_symbol
+    """
+    import time
+    results = {}
+    
+    # First: get the actual coins list to see exact format
+    try:
+        code, data = cs_get("/trade/api/v2/coins", {"exchange": EXCHANGE})
+        coins = data.get("data", {}).get(EXCHANGE, [])
+        results["coins_sample"] = coins[:10]
+        results["matic_in_list"] = "MATIC/INR" in coins
+        results["matic_lower"]   = "matic/inr" in coins
+        results["coins_count"]   = len(coins)
+    except Exception as e:
+        results["coins_error"] = str(e)
+
+    # Try exchangePrecision with different formats
+    formats_to_try = ["MATIC/INR", "matic/inr", "MATICINR", "maticinr"]
+    prec_results = {}
+    for fmt in formats_to_try:
+        try:
+            code, data = cs_post("/trade/api/v2/exchangePrecision",
+                                 {"exchange": EXCHANGE, "symbol": fmt})
+            prec_results[fmt] = {"code": code, "data": str(data)[:100]}
+        except Exception as e:
+            prec_results[fmt] = {"error": str(e)}
+        time.sleep(0.2)
+    results["precision_tests"] = prec_results
+
+    # Try depth with different formats
+    depth_results = {}
+    for fmt in formats_to_try:
+        try:
+            code, data = cs_get("/trade/api/v2/depth", {"symbol": fmt})
+            depth_results[fmt] = {"code": code, "has_asks": bool(data.get("data",{}).get("asks"))}
+        except Exception as e:
+            depth_results[fmt] = {"error": str(e)}
+        time.sleep(0.2)
+    results["depth_tests"] = depth_results
+
+    return jsonify(results)
+
 @app.route("/api/debug")
 @login_required
 def api_debug():
