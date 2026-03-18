@@ -1,118 +1,84 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   SENSEI BOT — 50-Year Professional Trading Engine              ║
-║   Philosophy: Protect capital first. Win consistently. Grow.    ║
+║  SENSEI BOT v5 — Built from CoinSwitch API docs ground-up        ║
+║  Source: https://api-trading.coinswitch.co/                      ║
 ║                                                                  ║
-║   Core Rules (from 50 years of trading wisdom):                 ║
-║   1. Never fight the trend — trade WITH momentum                ║
-║   2. Cut losses fast, let winners run                           ║
-║   3. Never risk more than 2% of capital per trade               ║
-║   4. Only trade when 3+ independent signals agree               ║
-║   5. Respect the market — it's always right                     ║
-║   6. No trade is also a trade — patience pays                   ║
+║  KEY FACTS FROM DOCS:                                            ║
+║  • Symbol format:  "BTC/INR"  (UPPERCASE with slash)             ║
+║  • Exchange:       "coinswitchx" (primary INR exchange)          ║
+║  • Order type:     "limit" with price required                   ║
+║  • Signature:      Ed25519, message = METHOD + endpoint + epoch  ║
+║  • Headers:        X-AUTH-APIKEY, X-AUTH-SIGNATURE, X-AUTH-EPOCH ║
+║  • Portfolio:      GET /trade/api/v2/user/portfolio               ║
+║  • Precision:      POST /trade/api/v2/exchangePrecision           ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
+
 import requests, time, json, os, threading, smtplib, math, secrets
+from datetime import datetime
 from urllib.parse import urlparse, urlencode
 from functools import wraps
 import urllib
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, session, redirect, url_for
 from collections import deque
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)  # Random session key each restart
+app.secret_key = secrets.token_hex(32)
 
-# ── Environment config ─────────────────────────────────────────
-CS_API_KEY    = os.environ.get("CS_API_KEY",    "YOUR_COINSWITCH_API_KEY")
-CS_SECRET_KEY = os.environ.get("CS_SECRET_KEY", "YOUR_COINSWITCH_SECRET_KEY")
+# ══════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════
+CS_API_KEY    = os.environ.get("CS_API_KEY",    "YOUR_API_KEY")
+CS_SECRET_KEY = os.environ.get("CS_SECRET_KEY", "YOUR_SECRET_KEY")
 GMAIL_USER    = os.environ.get("GMAIL_USER",    "your@gmail.com")
 GMAIL_PASS    = os.environ.get("GMAIL_PASS",    "your_app_password")
 ALERT_EMAIL   = os.environ.get("ALERT_EMAIL",   "your@gmail.com")
 CAPITAL       = float(os.environ.get("CAPITAL", "300"))
-ACCESS_KEY    = os.environ.get("ACCESS_KEY",    "sensei2024")  # Set this on Render!
+ACCESS_KEY    = os.environ.get("ACCESS_KEY",    "sensei2024")
 BASE_URL      = "https://coinswitch.co"
+EXCHANGE      = "coinswitchx"   # Primary INR exchange per docs
 
-# ── Universe of coins ──────────────────────────────────────────
+# All trading pairs — UPPERCASE with slash (exact format from docs)
 ALL_PAIRS = [
-    "DOGE/INR","XRP/INR","TRX/INR","SHIB/INR",
-    "BNB/INR","ADA/INR","MATIC/INR","LTC/INR",
-    "LINK/INR","DOT/INR","SOL/INR","AVAX/INR",
+    "DOGE/INR", "XRP/INR",  "TRX/INR",  "SHIB/INR",
+    "BNB/INR",  "ADA/INR",  "MATIC/INR","LTC/INR",
+    "LINK/INR", "DOT/INR",  "SOL/INR",  "AVAX/INR",
 ]
 
-# CoinSwitch exchange routing per coin (from /trade/api/v2/coins docs)
-# wazirx supports INR pairs, coinswitchx supports more coins
-COIN_EXCHANGE = {
-    "DOGE/INR":  "coinswitchx",
-    "XRP/INR":   "coinswitchx",
-    "TRX/INR":   "coinswitchx",
-    "SHIB/INR":  "coinswitchx",
-    "BNB/INR":   "coinswitchx",
-    "ADA/INR":   "coinswitchx",
-    "MATIC/INR": "coinswitchx",
-    "LTC/INR":   "coinswitchx",
-    "LINK/INR":  "coinswitchx",
-    "DOT/INR":   "coinswitchx",
-    "SOL/INR":   "coinswitchx",
-    "AVAX/INR":  "coinswitchx",
-}
-# Will be auto-updated by discover_exchanges() on startup
-BINANCE_MAP = {
-    "DOGE/INR":"DOGEUSDT","XRP/INR":"XRPUSDT","TRX/INR":"TRXUSDT",
-    "SHIB/INR":"SHIBUSDT","BNB/INR":"BNBUSDT","ADA/INR":"ADAUSDT",
-    "MATIC/INR":"MATICUSDT","LTC/INR":"LTCUSDT","LINK/INR":"LINKUSDT",
-    "DOT/INR":"DOTUSDT","SOL/INR":"SOLUSDT","AVAX/INR":"AVAXUSDT",
-}
+# Strategy settings
+ATR_TP_MULT        = 2.0
+ATR_SL_MULT        = 1.0
+MIN_REWARD_RISK    = 1.5
+SENSEI_MIN_SIGNALS = 4
+MAX_DAILY_TRADES   = 12
+MAX_DAILY_LOSS_PCT = 0.06
+MIN_ORDER_INR      = 100.0   # Safe buffer above CoinSwitch ₹50 minimum
 
-# ══════════════════════════════════════════════════════════════
-#  SENSEI RISK MANAGEMENT — The most important part
-# ══════════════════════════════════════════════════════════════
-MAX_RISK_PER_TRADE = 0.02   # Never risk more than 2% of capital
-MAX_DAILY_LOSS     = 0.06   # Stop trading if down 6% today
-MAX_DAILY_TRADES   = 12     # Quality over quantity
-MIN_REWARD_RISK    = 1.5    # Min 1.5:1 reward/risk (2.0 was blocking good setups)
-TRAILING_STOP      = True   # Move stop loss up as trade profits
-
-# ── Dynamic TP/SL based on ATR (market adapts automatically) ──
-ATR_TP_MULT  = 2.0   # TP = entry + 2.0 × ATR (achievable in ranging markets)
-ATR_SL_MULT  = 1.0   # SL = entry - 1.0 × ATR (tight but not too tight)
-
-# ══════════════════════════════════════════════════════════════
-#  SENSEI SIGNAL ENGINE — 6 independent confirmations
-# ══════════════════════════════════════════════════════════════
-# Each signal is independent. Sensei only trades when 4+ agree.
-# This gives ~65% win rate based on confluence trading principles.
-SENSEI_MIN_SIGNALS = 4   # Minimum signals to enter
-SENSEI_STRONG      = 5   # Strong entry — full position
-SENSEI_WEAK        = 4   # Decent entry — half position
-
-# ── State ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  STATE
+# ══════════════════════════════════════════════════════════
 state = {
     "running": False, "capital": CAPITAL, "current": CAPITAL,
     "wins": 0, "losses": 0, "total_pnl": 0.0, "daily_pnl": 0.0,
     "daily_trades": 0, "in_trade": False, "trade_sym": None,
     "entry_price": 0.0, "tp_price": 0.0, "sl_price": 0.0,
     "trail_sl": 0.0, "live_pnl": 0.0, "peak_price": 0.0,
-    "last_scan": "—", "coin_scores": {}, "per_trade": 0.0,
+    "per_trade": MIN_ORDER_INR,
+    "last_scan": "—", "coin_scores": {}, "position_size": 0.0,
     "log": deque(maxlen=150), "trades": deque(maxlen=300),
-    "sensei_mood": "PATIENT",   # PATIENT / HUNTING / IN_TRADE / PROTECTING
-    "market_regime": "UNKNOWN", # TRENDING / RANGING / VOLATILE
-    "signals_detail": {},
+    "sensei_mood": "PATIENT", "market_regime": "UNKNOWN",
+    "signals_detail": {}, "best_coin": None,
     "session_start": None,
-    "best_coin": None,
-    # Live wallet from CoinSwitch PRO
     "wallet": {
-        "inr_balance":     0.0,
-        "inr_locked":      0.0,
-        "total_value":     0.0,
-        "holdings":        {},
-        "last_updated":    "—",
-        "session_start_inr": 0.0,
-        "session_pnl":     0.0,
+        "inr_balance": 0.0, "inr_locked": 0.0, "total_value": 0.0,
+        "holdings": {}, "last_updated": "—",
+        "session_start_inr": 0.0, "session_pnl": 0.0,
     },
+    "precision_cache": {},   # {symbol: {base, quote, limit}}
+    "open_order_id": None,   # Track open order for status checking
 }
 
 def log(msg, level="INFO"):
@@ -125,62 +91,245 @@ def win_rate():
     return round(state["wins"] / t * 100, 1) if t else 0.0
 
 def daily_loss_pct():
-    return abs(state["daily_pnl"]) / state["capital"] * 100 if state["daily_pnl"] < 0 else 0
+    return abs(state["daily_pnl"]) / max(state["capital"], 1) * 100 if state["daily_pnl"] < 0 else 0
 
-# ══════════════════════════════════════════════════════════════
-#  EMAIL
-# ══════════════════════════════════════════════════════════════
-def send_alert(symbol, entry, exit_p, pnl, reason, signals):
-    if "your@gmail.com" in GMAIL_USER: return
-    color = "#00e676" if pnl >= 0 else "#ff3d57"
-    emoji = "💰" if pnl >= 0 else "🛑"
+# ══════════════════════════════════════════════════════════
+#  AUTH — Ed25519 exactly as per CoinSwitch docs
+# ══════════════════════════════════════════════════════════
+def make_headers(method, endpoint, params=None):
+    """
+    Signature per docs:
+      GET:  message = method + unquoted_endpoint_with_params + epoch_time
+      POST/DELETE: message = method + endpoint + epoch_time
+    """
+    epoch_time      = str(int(time.time() * 1000))
+    unquote_endpoint = endpoint
+
+    if method == "GET" and params and len(params) > 0:
+        endpoint         += ('&' if urlparse(endpoint).query else '?') + urlencode(params)
+        unquote_endpoint  = urllib.parse.unquote_plus(endpoint)
+
+    signature_msg    = method + unquote_endpoint + epoch_time
+    request_string   = bytes(signature_msg, 'utf-8')
+    secret_key_bytes = bytes.fromhex(CS_SECRET_KEY)
+    private_key      = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
+    signature        = private_key.sign(request_string).hex()
+
+    return {
+        "Content-Type":     "application/json",
+        "X-AUTH-APIKEY":    CS_API_KEY,
+        "X-AUTH-SIGNATURE": signature,
+        "X-AUTH-EPOCH":     epoch_time,
+    }, endpoint   # return modified endpoint for GET requests
+
+# ══════════════════════════════════════════════════════════
+#  COINSWITCH API CALLS — all in one place, no scattered code
+# ══════════════════════════════════════════════════════════
+
+def cs_get(endpoint, params=None):
+    """Authenticated GET request to CoinSwitch."""
+    headers, full_ep = make_headers("GET", endpoint, params)
+    r = requests.get(BASE_URL + full_ep, headers=headers, timeout=12)
+    return r.status_code, r.json()
+
+def cs_post(endpoint, payload):
+    """Authenticated POST request to CoinSwitch."""
+    headers, _ = make_headers("POST", endpoint)
+    body = json.dumps(payload, separators=(',', ':'))
+    r = requests.post(BASE_URL + endpoint, headers=headers, data=body, timeout=12)
+    return r.status_code, r.json()
+
+def cs_delete(endpoint, payload):
+    """Authenticated DELETE request — signature includes sorted payload per docs."""
+    epoch_time = str(int(time.time() * 1000))
+    body_str   = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+    sig_msg    = "DELETE" + endpoint + body_str
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(CS_SECRET_KEY))
+    signature   = private_key.sign(bytes(sig_msg, 'utf-8')).hex()
+    headers = {
+        "Content-Type": "application/json",
+        "X-AUTH-APIKEY": CS_API_KEY,
+        "X-AUTH-SIGNATURE": signature,
+        "X-AUTH-EPOCH": epoch_time,
+    }
+    r = requests.delete(BASE_URL + endpoint, headers=headers,
+                        data=json.dumps(payload, separators=(',', ':')), timeout=12)
+    return r.status_code, r.json()
+
+def validate_keys():
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"{emoji} SENSEI: {'+' if pnl>=0 else ''}₹{pnl:.2f} on {symbol}"
-        msg["From"] = GMAIL_USER; msg["To"] = ALERT_EMAIL
-        sig_html = "".join(f"<li style='color:{'#00e676' if v else '#5a7080'}'>{k}: {'✓' if v else '✗'}</li>" for k,v in signals.items())
-        msg.attach(MIMEText(f"""
-        <div style="font-family:monospace;background:#04060d;color:#c0d0e0;padding:28px;border-radius:14px;max-width:500px;border:1px solid #1a2535">
-          <div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:4px">SENSEI TRADING BOT</div>
-          <h2 style="color:{color};margin:0 0 20px;font-size:22px">{emoji} Trade {'Won' if pnl>=0 else 'Closed'} — {reason}</h2>
-          <table style="width:100%;border-collapse:collapse;margin-bottom:16px">
-            <tr><td style="padding:7px 0;color:#4a6070;border-bottom:1px solid #1a2535">Coin</td><td style="color:#18ffff;font-weight:bold">{symbol}</td></tr>
-            <tr><td style="padding:7px 0;color:#4a6070;border-bottom:1px solid #1a2535">Entry</td><td>₹{entry:.6f}</td></tr>
-            <tr><td style="padding:7px 0;color:#4a6070;border-bottom:1px solid #1a2535">Exit</td><td>₹{exit_p:.6f}</td></tr>
-            <tr><td style="padding:7px 0;color:#4a6070;border-bottom:1px solid #1a2535">P&L</td><td style="color:{color};font-size:24px;font-weight:bold">{'+'if pnl>=0 else ''}₹{pnl:.2f}</td></tr>
-            <tr><td style="padding:7px 0;color:#4a6070;border-bottom:1px solid #1a2535">Total P&L</td><td style="color:{color}">₹{state['total_pnl']:.2f}</td></tr>
-            <tr><td style="padding:7px 0;color:#4a6070">Win Rate</td><td style="color:#ffd740">{win_rate():.1f}% ({state['wins']}W / {state['losses']}L)</td></tr>
-          </table>
-          <div style="background:#0b0f1a;border-radius:8px;padding:12px;margin-bottom:12px">
-            <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:8px">SIGNALS THAT FIRED</div>
-            <ul style="list-style:none;padding:0;margin:0;font-size:12px;line-height:2">{sig_html}</ul>
-          </div>
-          <p style="color:#2a3a4a;font-size:11px">Sensei Bot • {datetime.now().strftime('%d %b %Y %H:%M IST')}</p>
-        </div>""", "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(GMAIL_USER, GMAIL_PASS)
-            s.sendmail(GMAIL_USER, ALERT_EMAIL, msg.as_string())
-        log(f"📧 Email sent: {symbol} {'+' if pnl>=0 else ''}₹{pnl:.2f}")
+        code, data = cs_get("/trade/api/v2/validate/keys")
+        return code == 200 and "Valid" in data.get("message", "")
     except Exception as e:
-        log(f"Email error: {e}", "ERR")
+        return False
 
-# ══════════════════════════════════════════════════════════════
-#  TECHNICAL INDICATORS — Professional grade
-# ══════════════════════════════════════════════════════════════
+def fetch_exchange_precision(symbol):
+    """
+    POST /trade/api/v2/exchangePrecision
+    Returns {base: 5, quote: 2, limit: 0} — decimal places for qty/price/min
+    """
+    if symbol in state["precision_cache"]:
+        return state["precision_cache"][symbol]
+    try:
+        code, data = cs_post("/trade/api/v2/exchangePrecision",
+                             {"exchange": EXCHANGE, "symbol": symbol})
+        if code == 200:
+            prec = data.get("data", {}).get(EXCHANGE, {}).get(symbol, {})
+            if prec:
+                state["precision_cache"][symbol] = prec
+                log(f"Precision {symbol}: base={prec.get('base')} quote={prec.get('quote')} limit={prec.get('limit')}", "INFO")
+                return prec
+    except Exception as e:
+        log(f"Precision fetch error: {e}", "ERR")
+    return {"base": 4, "quote": 2, "limit": 0}
+
+def fetch_depth(symbol):
+    """
+    GET /trade/api/v2/depth?symbol=SYMBOL
+    Returns best bid/ask for accurate order pricing.
+    """
+    try:
+        code, data = cs_get("/trade/api/v2/depth", {"symbol": symbol})
+        if code == 200:
+            d = data.get("data", {})
+            asks = d.get("asks", [])
+            bids = d.get("bids", [])
+            best_ask = float(asks[0][0]) if asks else None
+            best_bid = float(bids[0][0]) if bids else None
+            return best_ask, best_bid
+    except:
+        pass
+    return None, None
+
+def fetch_wallet():
+    """GET /trade/api/v2/user/portfolio — live INR balance."""
+    try:
+        code, data = cs_get("/trade/api/v2/user/portfolio")
+        if code != 200:
+            log(f"Portfolio error [{code}]: {data}", "ERR")
+            return
+        items = data.get("data", [])
+        inr_balance = inr_locked = 0.0
+        holdings = {}
+        for item in items:
+            cur  = item.get("currency", "").upper()
+            main = float(item.get("main_balance", 0) or 0)
+            lock = float(item.get("blocked_balance", 0) or 0)
+            if cur == "INR":
+                inr_balance, inr_locked = main, lock
+            elif main > 0 or lock > 0:
+                holdings[cur] = {"qty": main, "locked": lock}
+
+        w = state["wallet"]
+        prev = w.get("inr_balance", 0)
+
+        if w.get("session_start_inr", 0) == 0 and inr_balance > 0:
+            w["session_start_inr"] = inr_balance + inr_locked
+            log(f"💳 Wallet loaded — ₹{inr_balance:.2f} available + ₹{inr_locked:.2f} locked", "WALLET")
+            log(f"💳 Session start: ₹{w['session_start_inr']:.2f}", "WALLET")
+
+        if w["session_start_inr"] > 0:
+            w["session_pnl"] = round((inr_balance + inr_locked) - w["session_start_inr"], 2)
+
+        w.update({"inr_balance": inr_balance, "inr_locked": inr_locked,
+                  "total_value": inr_balance + inr_locked,
+                  "holdings": holdings, "last_updated": datetime.now().strftime("%H:%M:%S")})
+
+        if abs(inr_balance - prev) > 0.01 and prev > 0:
+            diff = inr_balance - prev
+            log(f"{'📈' if diff>0 else '📉'} Wallet: ₹{inr_balance:.2f} ({'+' if diff>0 else ''}₹{diff:.2f})", "WALLET")
+    except Exception as e:
+        log(f"Wallet error: {e}", "ERR")
+
+def place_order(symbol, side, amount_inr, fallback_price):
+    """
+    Place a limit order on CoinSwitch PRO.
+    From docs: POST /trade/api/v2/order
+    Required fields: symbol (UPPERCASE), side, type, price, quantity, exchange
+    """
+    # Step 1: Get live price from orderbook (most accurate)
+    best_ask, best_bid = fetch_depth(symbol)
+    if side.upper() == "BUY":
+        order_price = best_ask * 1.001 if best_ask else fallback_price * 1.002
+    else:
+        order_price = best_bid * 0.999 if best_bid else fallback_price * 0.998
+
+    # Step 2: Get exchange precision for correct decimal places
+    prec       = fetch_exchange_precision(symbol)
+    base_prec  = int(prec.get("base", 4))    # quantity decimal places
+    quote_prec = int(prec.get("quote", 2))   # price decimal places
+
+    # Step 3: Round price and quantity correctly
+    order_price = round(order_price, quote_prec)
+    raw_qty     = amount_inr / order_price
+    quantity    = round(raw_qty, base_prec)
+
+    # Step 4: Enforce minimum order size
+    if amount_inr < MIN_ORDER_INR:
+        log(f"⚠️ Raising ₹{amount_inr} → ₹{MIN_ORDER_INR} (minimum)", "WARN")
+        amount_inr  = MIN_ORDER_INR
+        quantity    = round(amount_inr / order_price, base_prec)
+
+    # Step 5: Build payload — EXACTLY as per CoinSwitch docs
+    payload = {
+        "symbol":   symbol,          # "MATIC/INR" — UPPERCASE with slash
+        "side":     side.lower(),    # "buy" or "sell"
+        "type":     "limit",
+        "price":    order_price,     # float, not string
+        "quantity": quantity,        # float, not string
+        "exchange": EXCHANGE,        # "coinswitchx"
+    }
+
+    log(f"Placing {side} {symbol} qty:{quantity} @ ₹{order_price} on {EXCHANGE}", "ORDER")
+    try:
+        code, data = cs_post("/trade/api/v2/order", payload)
+        log(f"Order [{code}]: {json.dumps(data)[:200]}", "ORDER")
+        if code == 200:
+            order_id = data.get("data", {}).get("order_id", "")
+            state["open_order_id"] = order_id
+            log(f"✅ Order placed! ID: {order_id}", "ORDER")
+        return code, data
+    except Exception as e:
+        log(f"Order exception: {e}", "ERR")
+        return 0, {"error": str(e)}
+
+def cancel_order(order_id):
+    """DELETE /trade/api/v2/order — cancel an open order."""
+    try:
+        code, data = cs_delete("/trade/api/v2/order", {"order_id": order_id})
+        log(f"Cancel [{code}]: {data}", "ORDER")
+        return code == 200
+    except Exception as e:
+        log(f"Cancel error: {e}", "ERR")
+        return False
+
+def get_order_status(order_id):
+    """GET /trade/api/v2/order?order_id=X — check if order executed."""
+    try:
+        code, data = cs_get("/trade/api/v2/order", {"order_id": order_id})
+        if code == 200:
+            return data.get("data", {}).get("status", "UNKNOWN")
+    except:
+        pass
+    return "UNKNOWN"
+
+# ══════════════════════════════════════════════════════════
+#  INDICATORS
+# ══════════════════════════════════════════════════════════
 def ema(p, n):
     if len(p) < n: return [p[-1]] * len(p)
     e = [sum(p[:n]) / n]; k = 2/(n+1)
     for x in p[n:]: e.append(x*k + e[-1]*(1-k))
     return [e[0]]*(len(p)-len(e)) + e
 
-def rsi(p, n=14):
+def calc_rsi(p, n=14):
     if len(p) < n+1: return 50.0
-    g=[max(p[i]-p[i-1],0) for i in range(1,len(p))]
-    l=[max(p[i-1]-p[i],0) for i in range(1,len(p))]
-    ag=sum(g[-n:])/n; al=sum(l[-n:])/n
-    return round(100-100/(1+ag/al),2) if al else 100.0
+    g = [max(p[i]-p[i-1], 0) for i in range(1, len(p))]
+    l = [max(p[i-1]-p[i], 0) for i in range(1, len(p))]
+    ag = sum(g[-n:])/n; al = sum(l[-n:])/n
+    return round(100-100/(1+ag/al), 2) if al else 100.0
 
-def macd(p):
+def calc_macd(p):
     e12=ema(p,12); e26=ema(p,26)
     ml=min(len(e12),len(e26))
     line=[e12[-ml+i]-e26[-ml+i] for i in range(ml)]
@@ -188,20 +337,17 @@ def macd(p):
     hist=[line[i]-sig[i] for i in range(min(len(line),len(sig)))]
     return line[-1], sig[-1], hist[-1] if hist else 0, hist[-2] if len(hist)>1 else 0
 
-def atr(h, l, c, n=14):
+def calc_atr(h, l, c, n=14):
     trs=[max(h[i]-l[i],abs(h[i]-c[i-1]),abs(l[i]-c[i-1])) for i in range(1,len(c))]
     if not trs: return 0
-    # Wilder smoothing
-    atr_v = sum(trs[:n])/n if len(trs)>=n else sum(trs)/len(trs)
-    for tr in trs[n:]:
-        atr_v = (atr_v*(n-1)+tr)/n
-    return atr_v
+    a = sum(trs[:n])/min(n,len(trs))
+    for tr in trs[n:]: a = (a*(n-1)+tr)/n
+    return a
 
 def bollinger(p, n=20):
-    if len(p)<n: v=p[-1]; return v*1.02,v,v*0.98,0
+    if len(p)<n: v=p[-1]; return v*1.02,v,v*0.98
     w=p[-n:]; m=sum(w)/n; s=(sum((x-m)**2 for x in w)/n)**.5
-    bw = (m+2*s - (m-2*s)) / m * 100  # bandwidth %
-    return m+2*s, m, m-2*s, round(bw,2)
+    return m+2*s, m, m-2*s
 
 def stochastic(c, h, l, n=14):
     if len(c)<n: return 50.0, 50.0
@@ -211,529 +357,184 @@ def stochastic(c, h, l, n=14):
     for i in range(max(0,len(c)-n-5), len(c)):
         s=max(0,i-n+1); lo2=min(l[s:i+1]); hi2=max(h[s:i+1])
         ks.append((c[i]-lo2)/(hi2-lo2)*100 if hi2!=lo2 else 50.0)
-    d=sum(ks[-3:])/min(3,len(ks)) if ks else 50.0
-    return k, d
+    return k, sum(ks[-3:])/min(3,len(ks)) if ks else 50.0
 
-def vwap(c, v):
+def calc_vwap(c, v):
     tv=sum(v); return sum(ci*vi for ci,vi in zip(c,v))/tv if tv else c[-1]
 
 def williams_r(c, h, l, n=14):
     if len(c)<n: return -50.0
     hi=max(h[-n:]); lo=min(l[-n:])
-    return round((hi-c[-1])/(hi-lo)*-100,2) if hi!=lo else -50.0
+    return round((hi-c[-1])/(hi-lo)*-100, 2) if hi!=lo else -50.0
 
-def obv(c, v):
-    """On Balance Volume — accumulation/distribution signal."""
+def calc_obv(c, v):
     o=0
     for i in range(1,len(c)):
-        if c[i]>c[i-1]: o+=v[i]
-        elif c[i]<c[i-1]: o-=v[i]
+        o += v[i] if c[i]>c[i-1] else (-v[i] if c[i]<c[i-1] else 0)
     return o
 
-def market_regime(c, h, l):
-    """Detect if market is trending, ranging, or volatile."""
-    if len(c)<20: return "UNKNOWN"
-    atr_v = atr(h,l,c,14)
-    price = c[-1]
-    atr_pct = atr_v/price*100 if price else 0
-    e20=ema(c,20); e50=ema(c,50) if len(c)>=50 else e20
-    trending = abs(e20[-1]-e50[-1])/e50[-1]*100 > 0.3
-    if atr_pct > 2.0: return "VOLATILE"
-    if trending: return "TRENDING"
-    return "RANGING"
-
-# ══════════════════════════════════════════════════════════════
-#  SENSEI SIGNAL ENGINE — 6 signals, need 4+ to trade
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+#  SENSEI 6-SIGNAL ENGINE
+# ══════════════════════════════════════════════════════════
 def sensei_analyze(closes, volumes, highs, lows):
-    """
-    The Sensei's 6-signal confluence system.
-    Each signal is independent. Need 4/6 to trade.
-    This is how professional traders filter out noise.
-
-    Returns: (score, signals_dict, confidence, atr_value, price)
-    """
-    if len(closes) < 50:
-        return 0, {}, 0, 0, closes[-1] if closes else 0
-
-    price  = closes[-1]
-    atr_v  = atr(highs, lows, closes, 14)
-    rsi_v  = rsi(closes, 14)
-    ml, ms, mh, mh_prev = macd(closes)
-    ef9    = ema(closes, 9)
-    ef21   = ema(closes, 21)
-    ef50   = ema(closes, 50)
-    bb_up, bb_mid, bb_lo, bb_bw = bollinger(closes, 20)
-    k, d   = stochastic(closes, highs, lows, 14)
-    wr     = williams_r(closes, highs, lows, 14)
-    obv_v  = obv(closes, volumes)
-    obv_prev = obv(closes[:-5], volumes[:-5])
-    vwap_v = vwap(closes[-20:], volumes[-20:])
+    if len(closes) < 50: return 0, {}, 0, 0, closes[-1]
+    price = closes[-1]
+    atr_v = calc_atr(highs, lows, closes)
+    rsi_v = calc_rsi(closes)
+    ml, ms, mh, mh_prev = calc_macd(closes)
+    ef9  = ema(closes, 9); ef21 = ema(closes, 21); ef50 = ema(closes, 50)
+    bb_up, bb_mid, bb_lo = bollinger(closes)
+    k, d = stochastic(closes, highs, lows)
+    wr   = williams_r(closes, highs, lows)
+    vwap_v = calc_vwap(closes[-20:], volumes[-20:])
     avg_vol = sum(volumes[-20:]) / 20
+    obv_now  = calc_obv(closes, volumes)
+    obv_prev = calc_obv(closes[:-5], volumes[:-5])
 
-    # ── SIGNAL 1: Trend Alignment ─────────────────────────────
-    # Price above EMA9 > EMA21 > EMA50 = strong uptrend
-    trend_aligned = ef9[-1] > ef21[-1] and ef21[-1] > ef50[-1] and price > ef9[-1]
-    # Also accept: EMA cross happening right now
-    ema_crossing  = ef9[-2] <= ef21[-2] and ef9[-1] > ef21[-1]
-    s1 = trend_aligned or ema_crossing
-
-    # ── SIGNAL 2: MACD Momentum ──────────────────────────────
-    # MACD line above signal AND histogram turning positive
-    macd_bull    = ml > ms
-    hist_turning = mh > 0 and mh > mh_prev  # histogram growing
-    s2 = macd_bull and hist_turning
-
-    # ── SIGNAL 3: RSI Sweet Spot ──────────────────────────────
-    # Not overbought, has room to run. Best: 40-60 (momentum zone)
-    # Also accept oversold recovery: RSI crossing 30 from below
-    rsi_momentum = 38 <= rsi_v <= 62
-    rsi_recovery = rsi_v > 30 and rsi(closes[:-3],14) <= 30  # just crossed up
-    s3 = rsi_momentum or rsi_recovery
-
-    # ── SIGNAL 4: Volume Confirms Move ───────────────────────
-    # Price going up on above-average volume = real buyers
-    vol_above_avg   = volumes[-1] > avg_vol * 1.08
-    obv_increasing  = obv_v > obv_prev  # more buying than selling
-    s4 = vol_above_avg and obv_increasing
-
-    # ── SIGNAL 5: Price Structure ─────────────────────────────
-    # Price above VWAP (institutional buy zone) OR
-    # Bouncing from Bollinger lower band (mean reversion)
-    above_vwap   = price > vwap_v
-    bb_bounce    = price <= bb_lo * 1.012 and price > bb_lo  # near but above lower
-    s5 = above_vwap or bb_bounce
-
-    # ── SIGNAL 6: Oscillator Confluence ──────────────────────
-    # Stochastic and Williams %R both showing buy conditions
-    stoch_bull  = k > d and k < 75   # stochastic bullish cross, not overbought
-    wr_buy      = -80 < wr < -20     # Williams not extreme
-    s6 = stoch_bull and wr_buy
+    c1 = (ef9[-2]<ef21[-2] and ef9[-1]>ef21[-1]) or (ef9[-1]>ef21[-1] and ef21[-1]>ef50[-1] and price>ef9[-1])
+    c2 = mh > 0 and mh > mh_prev and ml > ms
+    c3 = (38 <= rsi_v <= 62) or (rsi_v > 30 and calc_rsi(closes[:-3]) <= 30)
+    c4 = volumes[-1] > avg_vol * 1.08 and obv_now > obv_prev
+    c5 = price > vwap_v or (price <= bb_lo * 1.012)
+    c6 = k > d and k < 75 and (-80 < wr < -20)
 
     signals = {
-        "Trend Aligned  (EMA 9>21>50)": s1,
-        "MACD Momentum  (hist rising)":  s2,
-        "RSI Sweet Spot (38-62)":        s3,
-        "Volume + OBV   (buying flow)":  s4,
-        "Price Structure(VWAP/BB)":      s5,
-        "Oscillators    (Stoch+WillR)":  s6,
+        "Trend EMA (9>21>50)":     c1,
+        "MACD Hist rising":        c2,
+        "RSI Sweet Spot (38-62)":  c3,
+        "Volume + OBV flow":       c4,
+        "VWAP / Bollinger":        c5,
+        "Stoch + Williams R":      c6,
     }
     score = sum(signals.values())
-
-    # Confidence = weighted scoring of how strongly each signal fires
-    ema_gap_pct   = abs(ef9[-1]-ef21[-1])/price*100
-    macd_strength = abs(mh)/price*10000 if mh>0 else 0
-    rsi_quality   = max(0,(55-abs(rsi_v-50))/55)  # best at RSI=50
-    vol_ratio     = min(2.0, volumes[-1]/avg_vol) if avg_vol>0 else 1.0
-    vwap_quality  = min(1.0, abs(price-vwap_v)/price*100) if price>vwap_v else 0.2
-    stoch_quality = max(0,(70-k)/70) if k<70 else 0
-
-    conf_components = [
-        min(1.0, ema_gap_pct * 20),       # EMA separation
-        min(1.0, macd_strength * 5),       # MACD histogram power
-        rsi_quality,                        # RSI positioning
-        min(1.0, (vol_ratio-1)*2),         # Volume above average
-        vwap_quality,                       # VWAP distance
-        stoch_quality,                      # Stochastic headroom
+    fired = [i for i,(k_,v) in enumerate([(c1,c1),(c2,c2),(c3,c3),(c4,c4),(c5,c5),(c6,c6)]) if v]
+    conf_vals = [
+        min(1.0, abs(ef9[-1]-ef21[-1])/price*200),
+        min(1.0, abs(mh)/price*5000) if mh>0 else 0,
+        max(0, 1-(abs(rsi_v-50)/50)),
+        min(1.0, (volumes[-1]/avg_vol-1)*2) if volumes[-1]>avg_vol else 0,
+        min(1.0, abs(price-vwap_v)/price*100),
+        min(1.0, max(0,(75-k)/75)) if k<75 else 0,
     ]
-    # Only count components where that signal is actually firing
-    fired_confs = [conf_components[i] for i,fired in enumerate([s1,s2,s3,s4,s5,s6]) if fired]
-    confidence = round(sum(fired_confs)/max(1,len(fired_confs))*100, 1) if fired_confs else 0.0
-
+    fired_confs = [conf_vals[i] for i in range(6) if [c1,c2,c3,c4,c5,c6][i]]
+    confidence  = round(sum(fired_confs)/max(1,len(fired_confs))*100, 1)
     return score, signals, confidence, atr_v, price
 
-# ══════════════════════════════════════════════════════════════
-#  SENSEI POSITION SIZING — Risk-based (never gamble)
-# ══════════════════════════════════════════════════════════════
-def calc_position_size(capital, entry, sl, score):
-    """
-    Professional position sizing using fixed fractional method.
-    Risk exactly 2% of capital per trade. No more, no less.
-    """
-    risk_amount  = capital * MAX_RISK_PER_TRADE   # e.g. ₹6 on ₹300
-    price_risk   = entry - sl                      # distance to stop loss
-    if price_risk <= 0: return capital * 0.25      # fallback 25%
+def calc_position_size(capital, entry, sl_price, score):
+    risk_amount  = capital * 0.02
+    price_risk   = max(entry - sl_price, entry * 0.001)
+    raw_position = (risk_amount / price_risk) * entry
+    mult = {6:1.0, 5:0.85, 4:0.70}.get(score, 0.55)
+    pos  = max(MIN_ORDER_INR, min(raw_position * mult, capital * 0.80))
+    return round(pos, 2)
 
-    # How many units can we buy where losing all = 2% capital?
-    units        = risk_amount / price_risk
-    position_inr = units * entry
+def market_regime(c, h, l):
+    if len(c)<20: return "UNKNOWN"
+    atr_v = calc_atr(h,l,c)
+    if atr_v/c[-1]*100 > 2: return "VOLATILE"
+    e20=ema(c,20); e50=ema(c,50) if len(c)>=50 else e20
+    if abs(e20[-1]-e50[-1])/e50[-1]*100 > 0.3: return "TRENDING"
+    return "RANGING"
 
-    # Scale by signal strength
-    if score >= 6:   mult = 1.0   # all signals: full position
-    elif score == 5: mult = 0.80
-    elif score == 4: mult = 0.60
-    else:            mult = 0.40
-
-    position_inr = position_inr * mult
-
-    # Hard caps: minimum ₹50, maximum 35% of capital
-    position_inr = max(50, min(position_inr, capital * 0.35))
-    return round(position_inr, 2)
-
-# ══════════════════════════════════════════════════════════════
-#  COINSWITCH ORDER
-# ══════════════════════════════════════════════════════════════
-def make_signature(method, endpoint, params=None):
-    """
-    CoinSwitch PRO Ed25519 signature — from official docs.
-    signature_msg = METHOD + unquoted_endpoint_with_params + epoch_time
-    """
-    epoch_time = str(int(time.time() * 1000))
-    unquote_endpoint = endpoint
-
-    # For GET requests, append query params to endpoint before signing
-    if method == "GET" and params and len(params) > 0:
-        endpoint += ('&' if urlparse(endpoint).query else '?') + urlencode(params)
-        unquote_endpoint = urllib.parse.unquote_plus(endpoint)
-
-    signature_msg = method + unquote_endpoint + epoch_time
-    request_string = bytes(signature_msg, 'utf-8')
-
-    # Ed25519 signing
-    secret_key_bytes = bytes.fromhex(CS_SECRET_KEY)
-    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
-    signature_bytes = private_key.sign(request_string)
-    signature = signature_bytes.hex()
-
-    return signature, epoch_time
-
-def make_headers(method, endpoint, params=None):
-    signature, epoch_time = make_signature(method, endpoint, params)
-    return {
-        "Content-Type":     "application/json",
-        "X-AUTH-APIKEY":    CS_API_KEY,
-        "X-AUTH-SIGNATURE": signature,
-        "X-AUTH-EPOCH":     epoch_time,
-    }
-
-def get_trade_info(symbol):
-    """Get min/max order size and precision for a symbol."""
-    ep = "/trade/api/v2/tradeInfo"
+# ══════════════════════════════════════════════════════════
+#  EMAIL
+# ══════════════════════════════════════════════════════════
+def send_alert(symbol, entry, exit_p, pnl, reason, signals):
+    if "your@gmail.com" in GMAIL_USER: return
+    color = "#00e676" if pnl >= 0 else "#ff3d57"
+    emoji = "💰" if pnl >= 0 else "🛑"
     try:
-        headers = make_headers("GET", ep)
-        r = requests.get(BASE_URL + ep, headers=headers, timeout=10)
-        data = r.json()
-        # Find the symbol in trade info
-        sym_clean = symbol.replace("/","").lower()
-        for item in data.get("data", []):
-            if item.get("symbol","").lower().replace("/","") == sym_clean:
-                return item
-    except:
-        pass
-    return {}
-
-def get_best_price(symbol, side):
-    """
-    Get best available price from depth/orderbook.
-    For BUY use best ask, for SELL use best bid.
-    """
-    ep = "/trade/api/v2/depth"
-    params = {"symbol": symbol.lower()}
-    try:
-        # Depth is a public endpoint — no auth needed
-        r = requests.get(
-            BASE_URL + ep,
-            params=params,
-            headers={"Content-Type": "application/json"},
-            timeout=8
-        )
-        data = r.json()
-        if side.upper() == "BUY":
-            # asks[0] = lowest ask price (best price to buy)
-            asks = data.get("data", {}).get("asks", [])
-            if asks:
-                return float(asks[0][0])
-        else:
-            # bids[0] = highest bid price (best price to sell)
-            bids = data.get("data", {}).get("bids", [])
-            if bids:
-                return float(bids[0][0])
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"{emoji} SENSEI: {'+' if pnl>=0 else ''}₹{pnl:.2f} on {symbol}"
+        msg["From"] = GMAIL_USER; msg["To"] = ALERT_EMAIL
+        sig_html = "".join(f"<li style='color:{'#00e676' if v else '#5a7080'}'>{k}: {'✓' if v else '✗'}</li>"
+                          for k,v in signals.items())
+        msg.attach(MIMEText(f"""
+        <div style="font-family:monospace;background:#04060d;color:#c0d0e0;padding:24px;border-radius:12px;max-width:480px">
+          <h2 style="color:{color}">{emoji} {reason}</h2>
+          <table style="width:100%">
+            <tr><td style="color:#4a6070">Coin</td><td><b>{symbol}</b></td></tr>
+            <tr><td style="color:#4a6070">Entry</td><td>₹{entry:.6f}</td></tr>
+            <tr><td style="color:#4a6070">Exit</td><td>₹{exit_p:.6f}</td></tr>
+            <tr><td style="color:#4a6070">P&L</td><td style="color:{color};font-size:20px"><b>{'+'if pnl>=0 else ''}₹{pnl:.2f}</b></td></tr>
+            <tr><td style="color:#4a6070">Total P&L</td><td>₹{state['total_pnl']:.2f}</td></tr>
+            <tr><td style="color:#4a6070">Win Rate</td><td>{win_rate():.1f}%</td></tr>
+          </table>
+          <ul style="list-style:none;padding:0;font-size:11px;line-height:2">{sig_html}</ul>
+        </div>""", "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(GMAIL_USER, GMAIL_PASS)
+            s.sendmail(GMAIL_USER, ALERT_EMAIL, msg.as_string())
+        log(f"📧 Alert sent: {symbol}")
     except Exception as e:
-        log(f"Depth fetch error: {e}", "ERR")
-    return None
+        log(f"Email error: {e}", "ERR")
 
-def place_order(symbol, side, amount_inr, price):
-    """
-    Place a LIMIT order on CoinSwitch PRO (market orders need price too).
-    Uses Ed25519 signature + price from live orderbook.
-    """
-    ep  = "/trade/api/v2/order"
-    sym = symbol.lower()
-
-    # Try to get live best price from orderbook
-    live_price = get_best_price(symbol, side)
-    if live_price:
-        # Use live price with small buffer for fills:
-        # BUY: pay slightly above best ask (ensures fill)
-        # SELL: accept slightly below best bid (ensures fill)
-        if side.upper() == "BUY":
-            order_price = round(live_price * 1.002, 8)  # 0.2% above ask
-        else:
-            order_price = round(live_price * 0.998, 8)  # 0.2% below bid
-        log(f"Live orderbook price for {sym}: ₹{live_price} → order @ ₹{order_price}", "ORDER")
-    else:
-        # Fallback to Binance price passed in
-        order_price = round(price, 8)
-        log(f"Using Binance fallback price: ₹{order_price}", "ORDER")
-
-    # Enforce CoinSwitch minimum order size (₹80 for safety margin above ₹50 min)
-    MIN_ORDER_INR = 80.0
-    if amount_inr < MIN_ORDER_INR:
-        log(f"⚠️ Raising order from ₹{amount_inr} to minimum ₹{MIN_ORDER_INR}", "WARN")
-        amount_inr = MIN_ORDER_INR
-
-    # Calculate quantity with correct precision
-    raw_qty = amount_inr / order_price
-    if raw_qty >= 10000:
-        qty = round(raw_qty, 0)      # SHIB: 87912 → 87912
-    elif raw_qty >= 100:
-        qty = round(raw_qty, 1)      # ADA: 2.97 → round to 1dp
-    elif raw_qty >= 1:
-        qty = round(raw_qty, 4)      # BTC: 0.0012
-    else:
-        qty = round(raw_qty, 6)      # Very expensive coins
-
-    # Get the correct exchange for this symbol
-    exchange = COIN_EXCHANGE.get(symbol, "coinswitchx")
-
-    # CoinSwitch requires: symbol, side, type, price, quantity, exchange
-    payload = {
-        "symbol":   sym,
-        "side":     side.lower(),
-        "type":     "limit",
-        "price":    float(round(order_price, 8)),
-        "quantity": float(qty),
-        "exchange": exchange,
-    }
-    body = json.dumps(payload, separators=(',', ':'))
-    log(f"Order payload: {body}", "ORDER")
-
-    try:
-        headers = make_headers("POST", ep)
-        r = requests.post(
-            BASE_URL + ep,
-            headers=headers,
-            data=body,
-            timeout=15
-        )
-        result = r.json()
-        log(f"Order [{r.status_code}] {side} {sym} qty:{qty} @ ₹{order_price}: {json.dumps(result)[:200]}", "ORDER")
-        return result
-    except Exception as e:
-        log(f"Order exception: {e}", "ERR")
-        return {"error": str(e)}
-
-def fetch_wallet_balance():
-    """
-    Fetch real wallet from CoinSwitch PRO portfolio API.
-    Endpoint: GET /trade/api/v2/user/portfolio
-    Response example:
-    {
-      "data": [
-        {"currency": "INR",  "main_balance": 250.50, "blocked_balance": 50.0},
-        {"currency": "DOGE", "main_balance": 1500.0, "blocked_balance": 0.0},
-        ...
-      ]
-    }
-    Updates state["wallet"] with live balances.
-    """
-    ep = "/trade/api/v2/user/portfolio"
-    try:
-        headers = make_headers("GET", ep)
-        r = requests.get(BASE_URL + ep, headers=headers, timeout=10)
-        data = r.json()
-
-        if r.status_code != 200:
-            log(f"Portfolio API error [{r.status_code}]: {r.text[:200]}", "ERR")
-            return
-
-        items = data.get("data", [])
-        inr_balance  = 0.0
-        inr_locked   = 0.0
-        holdings     = {}
-
-        for item in items:
-            currency = item.get("currency", "").upper()
-            main_bal = float(item.get("main_balance", 0) or 0)
-            locked   = float(item.get("blocked_balance", 0) or 0)
-
-            if currency == "INR":
-                inr_balance = main_bal
-                inr_locked  = locked
-            elif main_bal > 0 or locked > 0:
-                holdings[currency] = {
-                    "qty":    main_bal,
-                    "locked": locked,
-                }
-
-        # Update state wallet
-        w = state["wallet"]
-        prev_inr = w.get("inr_balance", 0)
-
-        # On first fetch, set session start balance
-        if w.get("session_start_inr", 0) == 0 and inr_balance > 0:
-            w["session_start_inr"] = inr_balance + inr_locked
-            log(f"💳 Wallet loaded — INR: ₹{inr_balance:.2f} available + ₹{inr_locked:.2f} locked", "WALLET")
-            log(f"💳 Session start balance: ₹{w['session_start_inr']:.2f}", "WALLET")
-
-        # Calculate real session P&L from wallet
-        if w["session_start_inr"] > 0:
-            total_now = inr_balance + inr_locked
-            w["session_pnl"] = round(total_now - w["session_start_inr"], 2)
-
-        w["inr_balance"]     = inr_balance
-        w["inr_locked"]      = inr_locked
-        w["total_value"]     = inr_balance + inr_locked
-        w["holdings"]        = holdings
-        w["last_updated"]    = datetime.now().strftime("%H:%M:%S")
-
-        # Log balance change if significant
-        if abs(inr_balance - prev_inr) > 0.01 and prev_inr > 0:
-            diff = inr_balance - prev_inr
-            emoji = "📈" if diff > 0 else "📉"
-            log(f"{emoji} Wallet update: ₹{inr_balance:.2f} available ({'+' if diff>0 else ''}₹{diff:.2f})", "WALLET")
-
-    except Exception as e:
-        log(f"Wallet fetch error: {e}", "ERR")
-
-def get_portfolio():
-    """Legacy wrapper — calls fetch_wallet_balance."""
-    fetch_wallet_balance()
-    return state["wallet"]
-
-# Cache exchange precision info
-_precision_cache = {}
-
-def get_precision(symbol):
-    """
-    Get min order size and decimal precision for a symbol.
-    Cached after first fetch.
-    """
-    global _precision_cache
-    sym = symbol.lower()
-    if sym in _precision_cache:
-        return _precision_cache[sym]
-    try:
-        ep = "/trade/api/v2/exchangePrecision"
-        payload = json.dumps({"symbols": [sym]}, separators=(',', ':'))
-        headers = make_headers("POST", ep)
-        r = requests.post(BASE_URL + ep, headers=headers, data=payload, timeout=10)
-        data = r.json()
-        # Response has precision data per symbol
-        for item in data.get("data", []):
-            if item.get("symbol","").lower() == sym:
-                _precision_cache[sym] = item
-                log(f"Precision for {sym}: {item}", "INFO")
-                return item
-    except Exception as e:
-        log(f"Precision fetch error: {e}", "ERR")
-    return {}
-
-def discover_exchanges():
-    """
-    Fetch which exchange supports each coin from CoinSwitch API.
-    Updates COIN_EXCHANGE dict automatically.
-    """
-    global COIN_EXCHANGE
-    exchanges_to_check = ["coinswitchx", "wazirx"]
-    for exchange in exchanges_to_check:
-        try:
-            ep = f"/trade/api/v2/coins?exchange={exchange}"
-            headers = make_headers("GET", ep)
-            r = requests.get(BASE_URL + ep, headers=headers, timeout=10)
-            data = r.json()
-            coins = data.get("data", {}).get(exchange, [])
-            for coin in coins:
-                coin_upper = coin.upper()
-                if coin_upper in ALL_PAIRS and coin_upper not in COIN_EXCHANGE:
-                    COIN_EXCHANGE[coin_upper] = exchange
-            log(f"Exchange {exchange}: {len(coins)} coins available", "INFO")
-        except Exception as e:
-            log(f"Exchange discovery error for {exchange}: {e}", "ERR")
-    log(f"Exchange mapping: {COIN_EXCHANGE}", "INFO")
-
-def validate_keys():
-    """Test if API keys work."""
-    ep = "/trade/api/v2/validate/keys"
-    try:
-        headers = make_headers("GET", ep)
-        r = requests.get(BASE_URL + ep, headers=headers, timeout=10)
-        return r.status_code == 200, r.json()
-    except Exception as e:
-        return False, {"error": str(e)}
-
-# ══════════════════════════════════════════════════════════════
-#  FLASK ROUTES
-# ══════════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 #  AUTH MIDDLEWARE
-# ══════════════════════════════════════════════════════════════
-from flask import session, redirect, url_for
-
+# ══════════════════════════════════════════════════════════
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not session.get("authenticated"):
-            return redirect(url_for("login_page"))
+            return redirect(url_for("login_page")) if request.method == "GET" else (jsonify({"error":"unauthorized"}), 401)
         return f(*args, **kwargs)
     return decorated
 
 @app.route("/login", methods=["GET", "POST"])
 def login_page():
-    error = None
     if request.method == "POST":
         entered = (request.json or request.form).get("key", "")
         if entered == ACCESS_KEY:
             session["authenticated"] = True
-            session.permanent = True
             return jsonify({"ok": True}) if request.is_json else redirect(url_for("index"))
-        else:
-            if request.is_json:
-                return jsonify({"ok": False, "error": "Wrong access key"}), 401
-            error = "Wrong key. Try again."
-    return render_template("login.html", error=error)
+        return jsonify({"ok": False, "error": "Wrong access key"}), 401 if request.is_json else render_template("login.html", error="Wrong key.")
+    return render_template("login.html", error=None)
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login_page"))
 
+# ══════════════════════════════════════════════════════════
+#  FLASK ROUTES
+# ══════════════════════════════════════════════════════════
 @app.route("/")
 @login_required
-def index(): return render_template("index.html")
+def index():
+    return render_template("index.html")
 
 @app.route("/api/state")
 @login_required
 def api_state():
     t = state["wins"] + state["losses"]
-    logs = [{"ts":l["ts"],"msg":l["msg"],"level":l["level"]} for l in list(state["log"])[:30]]
     return jsonify({
-        "running":       state["running"],
-        "capital":       state["capital"],
-        "current":       round(state["current"], 2),
-        "pnl":           round(state["total_pnl"], 2),
-        "daily_pnl":     round(state["daily_pnl"], 2),
-        "wins":          state["wins"],
-        "losses":        state["losses"],
-        "win_rate":      round(state["wins"]/t*100,1) if t else 0,
-        "daily_trades":  state["daily_trades"],
-        "in_trade":      state["in_trade"],
-        "trade_sym":     state["trade_sym"],
-        "entry_price":   state["entry_price"],
-        "tp_price":      round(state["tp_price"], 6),
-        "sl_price":      round(state["sl_price"], 6),
-        "trail_sl":      round(state["trail_sl"], 6),
-        "live_pnl":      state["live_pnl"],
-        "peak_price":    state["peak_price"],
-        "last_scan":     state["last_scan"],
-        "coin_scores":   state["coin_scores"],
-        "log":           logs,
-        "trades":        list(state["trades"])[:20],
-        "sensei_mood":   state["sensei_mood"],
-        "market_regime": state["market_regime"],
-        "signals_detail":state["signals_detail"],
-        "best_coin":     state["best_coin"],
-        "daily_loss_pct":round(daily_loss_pct(), 1),
+        "running":        state["running"],
+        "capital":        state["capital"],
+        "current":        round(state["current"], 2),
+        "pnl":            round(state["total_pnl"], 2),
+        "daily_pnl":      round(state["daily_pnl"], 2),
+        "wins":           state["wins"],
+        "losses":         state["losses"],
+        "win_rate":       round(state["wins"]/t*100,1) if t else 0,
+        "daily_trades":   state["daily_trades"],
+        "in_trade":       state["in_trade"],
+        "trade_sym":      state["trade_sym"],
+        "entry_price":    state["entry_price"],
+        "tp_price":       round(state["tp_price"], 8),
+        "sl_price":       round(state["sl_price"], 8),
+        "trail_sl":       round(state["trail_sl"], 8),
+        "live_pnl":       state["live_pnl"],
+        "peak_price":     state["peak_price"],
+        "per_trade":      state["per_trade"],
+        "last_scan":      state["last_scan"],
+        "coin_scores":    state["coin_scores"],
+        "log":            [{"ts":l["ts"],"msg":l["msg"],"level":l["level"]} for l in list(state["log"])[:30]],
+        "trades":         list(state["trades"])[:20],
+        "sensei_mood":    state["sensei_mood"],
+        "market_regime":  state["market_regime"],
+        "signals_detail": state["signals_detail"],
+        "best_coin":      state["best_coin"],
+        "daily_loss_pct": round(daily_loss_pct(), 1),
         "wallet": {
             "inr_balance":   round(state["wallet"]["inr_balance"], 2),
             "inr_locked":    round(state["wallet"]["inr_locked"], 2),
@@ -746,199 +547,124 @@ def api_state():
     })
 
 @app.route("/api/start", methods=["POST"])
+@login_required
 def api_start():
     d   = request.json or {}
     cap = float(d.get("capital", CAPITAL))
-
-    # Dynamic per-trade sizing to always meet CoinSwitch ₹50 minimum
-    if cap <= 150:
-        per_trade = max(80.0, cap * 0.85)   # ₹100 → ₹85
-    elif cap <= 300:
-        per_trade = max(80.0, cap * 0.60)   # ₹200 → ₹120
-    elif cap <= 600:
-        per_trade = max(80.0, cap * 0.45)   # ₹500 → ₹225
-    else:
-        per_trade = max(80.0, cap * 0.30)   # ₹1000+ → 30%
-
-    per_trade = round(per_trade, 2)
+    # Scale per-trade to always meet MIN_ORDER_INR
+    per_trade = max(MIN_ORDER_INR, round(cap * (0.80 if cap<=200 else 0.55 if cap<=500 else 0.35), 2))
     state.update({
-        "running":True,"capital":cap,"current":cap,"wins":0,"losses":0,
-        "total_pnl":0.0,"daily_pnl":0.0,"daily_trades":0,"in_trade":False,
-        "sensei_mood":"PATIENT","session_start":datetime.now().strftime("%H:%M"),
-        "per_trade": per_trade,
+        "running": True, "capital": cap, "current": cap,
+        "wins": 0, "losses": 0, "total_pnl": 0.0, "daily_pnl": 0.0,
+        "daily_trades": 0, "in_trade": False, "per_trade": per_trade,
+        "sensei_mood": "PATIENT", "session_start": datetime.now().strftime("%H:%M"),
     })
-    log(f"🎌 SENSEI awakens. Capital ₹{cap} | Per trade: ₹{per_trade} | Min order ₹80 ✅", "START")
-    log("📋 Rules: 4/6 signals needed | ATR-based TP/SL | Trailing stop active", "INFO")
-    # Validate API keys on startup
-    def check_keys_and_wallet():
-        time.sleep(1)
-        ok, resp = validate_keys()
+    log(f"🎌 SENSEI v5 awakens | Capital ₹{cap} | Per trade ₹{per_trade} | Exchange: {EXCHANGE}", "START")
+    log(f"📋 Signal threshold: {SENSEI_MIN_SIGNALS}/6 | Min order: ₹{MIN_ORDER_INR} | Max daily loss: {MAX_DAILY_LOSS_PCT*100:.0f}%", "INFO")
+
+    def startup():
+        time.sleep(0.5)
+        ok = validate_keys()
         if ok:
-            log("✅ API keys validated — real trading ACTIVE on CoinSwitch PRO", "START")
+            log("✅ API keys valid — LIVE trading on CoinSwitch PRO", "START")
             time.sleep(0.3)
-            discover_exchanges()     # Find correct exchange per coin
-            time.sleep(0.3)
-            fetch_wallet_balance()   # Load real wallet immediately
+            fetch_wallet()
         else:
-            log(f"❌ API key validation failed: {resp} — check Render env vars", "ERR")
-    threading.Thread(target=check_keys_and_wallet, daemon=True).start()
-    return jsonify({"ok":True})
+            log("❌ API key validation FAILED — check Render env vars CS_API_KEY / CS_SECRET_KEY", "ERR")
+    threading.Thread(target=startup, daemon=True).start()
+    return jsonify({"ok": True})
 
 @app.route("/api/stop", methods=["POST"])
+@login_required
 def api_stop():
     state["running"] = False
     state["sensei_mood"] = "RESTING"
     log(f"🏁 Session ended | P&L: ₹{state['total_pnl']:.2f} | WR: {win_rate():.1f}%", "STOP")
-    return jsonify({"ok":True})
-
-@app.route("/api/wallet/refresh", methods=["POST"])
-@login_required
-def api_wallet_refresh():
-    """Manually refresh wallet balance."""
-    threading.Thread(target=fetch_wallet_balance, daemon=True).start()
-    return jsonify({"ok": True, "msg": "Wallet refresh triggered"})
-
-@app.route("/api/debug/keys")
-@login_required
-def debug_keys():
-    """Test API keys and return detailed diagnosis."""
-    results = {}
-
-    # Check key format
-    key_len = len(CS_API_KEY)
-    secret_len = len(CS_SECRET_KEY)
-    results["api_key_length"] = key_len
-    results["secret_key_length"] = secret_len
-    results["secret_is_hex"] = all(c in "0123456789abcdefABCDEF" for c in CS_SECRET_KEY)
-    results["secret_is_64_chars"] = secret_len == 64
-    results["api_key_set"] = CS_API_KEY != "YOUR_COINSWITCH_API_KEY"
-    results["secret_key_set"] = CS_SECRET_KEY != "YOUR_COINSWITCH_SECRET_KEY"
-
-    # Try server time (no auth needed)
-    try:
-        r = requests.get("https://coinswitch.co/trade/api/v2/time", timeout=8)
-        results["server_time_status"] = r.status_code
-        results["server_time"] = r.json()
-    except Exception as e:
-        results["server_time_error"] = str(e)
-
-    # Try validate keys
-    try:
-        ep = "/trade/api/v2/validate/keys"
-        headers = make_headers("GET", ep)
-        r = requests.get("https://coinswitch.co" + ep, headers=headers, timeout=10)
-        results["validate_status"] = r.status_code
-        results["validate_response"] = r.text[:300]
-    except Exception as e:
-        results["validate_error"] = str(e)
-
-    # Try portfolio
-    try:
-        ep = "/trade/api/v2/user/portfolio"
-        headers = make_headers("GET", ep)
-        r = requests.get("https://coinswitch.co" + ep, headers=headers, timeout=10)
-        results["portfolio_status"] = r.status_code
-        results["portfolio_response"] = r.text[:300]
-    except Exception as e:
-        results["portfolio_error"] = str(e)
-
-    return jsonify(results)
+    return jsonify({"ok": True})
 
 @app.route("/api/candles", methods=["POST"])
+@login_required
 def api_candles():
-    if not state["running"]: return jsonify({"action":"idle"})
-
-    # ── Daily loss circuit breaker ──────────────────────
-    if daily_loss_pct() >= MAX_DAILY_LOSS * 100:
+    if not state["running"]: return jsonify({"action": "idle"})
+    if daily_loss_pct() >= MAX_DAILY_LOSS_PCT * 100:
         state["sensei_mood"] = "PROTECTING"
-        log(f"🛡️ Daily loss limit {MAX_DAILY_LOSS*100:.0f}% reached. Sensei stops for the day.", "WARN")
-        return jsonify({"action":"daily_limit"})
-
+        log("🛡 Daily loss limit reached. Sensei stops for the day.", "WARN")
+        return jsonify({"action": "daily_limit"})
     if state["daily_trades"] >= MAX_DAILY_TRADES:
         state["sensei_mood"] = "RESTING"
-        log("📿 Daily trade limit reached. Sensei rests.", "INFO")
-        return jsonify({"action":"trade_limit"})
+        return jsonify({"action": "trade_limit"})
 
-    data    = request.json or {}
-    all_c   = data.get("candles", {})
-    min_sig = int(data.get("min_signals", SENSEI_MIN_SIGNALS))
+    data  = request.json or {}
+    all_c = data.get("candles", {})
+    min_s = int(data.get("min_signals", SENSEI_MIN_SIGNALS))
     state["last_scan"] = datetime.now().strftime("%H:%M:%S")
+    per_trade = state["per_trade"]
 
-    # ═══════════════════════════════════════════════════
-    #  IN TRADE: Monitor with trailing stop
-    # ═══════════════════════════════════════════════════
+    # ── IN TRADE: monitor + trailing stop ──────────────────
     if state["in_trade"]:
-        sym  = state["trade_sym"]
-        c    = all_c.get(sym, {})
+        sym    = state["trade_sym"]
+        c      = all_c.get(sym, {})
         closes = c.get("closes", [])
-        if not closes: return jsonify({"action":"wait"})
+        if not closes: return jsonify({"action": "wait"})
 
-        price    = closes[-1]
-        rsi_now  = rsi(closes)
-        position = state.get("position_size", state["capital"]*0.25)
-        lpnl     = round((price - state["entry_price"]) / state["entry_price"] * position, 2)
+        price   = closes[-1]
+        rsi_now = calc_rsi(closes)
+        pos     = state.get("position_size", per_trade)
+        lpnl    = round((price - state["entry_price"]) / state["entry_price"] * pos, 2)
         state["live_pnl"] = lpnl
 
-        # Update trailing stop loss (moves up with price)
-        if TRAILING_STOP and price > state["peak_price"]:
+        # Trailing stop — move up with price
+        if price > state["peak_price"]:
             state["peak_price"] = price
-            # Trail stop = peak - 1.5 × ATR
             highs  = c.get("highs", closes)
             lows   = c.get("lows",  closes)
-            atr_v  = atr(highs, lows, closes, 14)
+            atr_v  = calc_atr(highs, lows, closes)
             new_sl = price - atr_v * 1.5
             if new_sl > state["trail_sl"]:
                 state["trail_sl"] = new_sl
                 if new_sl > state["sl_price"]:
                     state["sl_price"] = new_sl
-                    log(f"📈 Trail stop moved up → ₹{new_sl:.5f}", "TRAIL")
+                    log(f"📈 Trail SL → ₹{new_sl:.6f}", "TRAIL")
 
         state["sensei_mood"] = "IN_TRADE"
+        log(f"👁 {sym} ₹{price:.6f} | RSI:{rsi_now:.1f} | P&L:₹{lpnl:+.2f} | SL:₹{state['sl_price']:.6f}", "WATCH")
 
         reason = None
         if   price >= state["tp_price"]:  reason = "TAKE_PROFIT ✅"
         elif price <= state["sl_price"]:  reason = "STOP_LOSS 🛑"
-        elif rsi_now > 78:                reason = "RSI_EXTREME_EXIT"
-        elif lpnl > 0 and rsi_now > 70:  reason = "PROFIT_PROTECT_EXIT"
+        elif rsi_now > 78:                reason = "RSI_OVERBOUGHT"
+        elif lpnl > 0 and rsi_now > 70:  reason = "PROFIT_PROTECT"
 
         if reason:
-            place_order(sym, "SELL", position, price)
-            pnl = round((price-state["entry_price"])/state["entry_price"]*position, 2)
-            state["total_pnl"] += pnl
-            state["daily_pnl"] += pnl
-            state["current"]   += pnl
+            code, result = place_order(sym, "SELL", pos, price)
+            pnl = round((price - state["entry_price"]) / state["entry_price"] * pos, 2)
+            state["total_pnl"]    += pnl
+            state["daily_pnl"]    += pnl
+            state["current"]      += pnl
             state["daily_trades"] += 1
-            if pnl >= 0: state["wins"] += 1
+            if pnl >= 0: state["wins"]   += 1
             else:        state["losses"] += 1
-            sigs = state.get("signals_detail", {})
             state["trades"].appendleft({
-                "time":state["last_scan"],"sym":sym,
-                "entry":state["entry_price"],"exit":price,
-                "pnl":pnl,"reason":reason,
-                "signals":sum(sigs.values()) if sigs else 0,
-                "wr": win_rate(),
+                "time": state["last_scan"], "sym": sym,
+                "entry": state["entry_price"], "exit": price,
+                "pnl": pnl, "reason": reason, "signals": sum(state["signals_detail"].values()),
             })
             entry_was = state["entry_price"]
-            state.update({"in_trade":False,"trade_sym":None,"live_pnl":0.0,
-                          "peak_price":0.0,"trail_sl":0.0,"sensei_mood":"PATIENT"})
-            log(f"{'💰 WIN' if pnl>=0 else '🛑 LOSS'} {sym} | ₹{pnl:+.2f} | Total ₹{state['total_pnl']:.2f} | WR {win_rate():.1f}%",
+            sigs = state["signals_detail"].copy()
+            state.update({"in_trade": False, "trade_sym": None, "live_pnl": 0.0,
+                          "peak_price": 0.0, "trail_sl": 0.0, "sensei_mood": "PATIENT",
+                          "open_order_id": None})
+            log(f"{'💰 WIN' if pnl>=0 else '🛑 LOSS'} {sym} ₹{pnl:+.2f} | Total ₹{state['total_pnl']:.2f} | WR {win_rate():.1f}%",
                 "WIN" if pnl>=0 else "LOSS")
-            # Refresh wallet after trade to show real balance change
-            threading.Thread(target=fetch_wallet_balance, daemon=True).start()
-            threading.Thread(target=send_alert,
-                args=(sym,entry_was,price,pnl,reason,sigs), daemon=True).start()
-        else:
-            log(f"👁️ {sym} ₹{price:.5f} | RSI:{rsi_now:.1f} | P&L:₹{lpnl:+.2f} | SL:₹{state['sl_price']:.5f}", "WATCH")
-        return jsonify({"action":"monitoring"})
+            threading.Thread(target=fetch_wallet, daemon=True).start()
+            threading.Thread(target=send_alert, args=(sym,entry_was,price,pnl,reason,sigs), daemon=True).start()
+        return jsonify({"action": "monitoring"})
 
-    # ═══════════════════════════════════════════════════
-    #  SCANNING: Find the best trade setup
-    # ═══════════════════════════════════════════════════
+    # ── SCAN: find best trade ───────────────────────────────
     state["sensei_mood"] = "HUNTING"
-    log(f"🔍 Sensei scanning {len(all_c)} coins for high-probability setups...", "SCAN")
-    state["market_regime"]  # will be updated below
+    log(f"🔍 Scanning {len(all_c)} coins...", "SCAN")
     scores = {}
-    best   = {"sym":None,"score":0,"conf":0,"atr":0,"price":0,"signals":{},"position":0}
+    best   = {"sym": None, "score": 0, "conf": 0, "atr": 0, "price": 0, "signals": {}, "pos": 0, "tp": 0, "sl": 0}
     regimes = []
 
     for sym, candles in all_c.items():
@@ -949,90 +675,101 @@ def api_candles():
         if len(closes) < 50: continue
         try:
             sc, sigs, conf, atr_v, price = sensei_analyze(closes, volumes, highs, lows)
-            regime = market_regime(closes, highs, lows)
-            regimes.append(regime)
-
-            # Dynamic TP/SL using ATR
-            tp = price + atr_v * ATR_TP_MULT
-            sl = price - atr_v * ATR_SL_MULT
-
-            # Reward/risk check
-            rr = (tp-price)/(price-sl) if (price-sl)>0 else 0
-
-            scores[sym] = {
-                "score":sc, "conf":conf, "price":round(price,5),
-                "rsi":rsi(closes), "signals":sigs,
-                "atr_pct":round(atr_v/price*100,3),
-                "regime":regime, "rr":round(rr,2),
-            }
-            log(f"  {sym:<12} {sc}/6 signals | conf:{conf}% | rr:{rr:.1f} | {regime}", "SCORE")
-
-            if sc > best["score"] or (sc == best["score"] and conf > best["conf"]):
-                if rr >= MIN_REWARD_RISK:  # Only consider if RR is good
-                    # Only skip if VERY low confidence AND very low score
-                    if regime == "RANGING" and conf < 10.0 and sc < 4:
-                        log(f"  ⏭️ Skipping {sym} — low conf {conf}% + weak signal", "WAIT")
-                        continue
-                    pos = calc_position_size(state["capital"], price, sl, sc)
-                    best.update({"sym":sym,"score":sc,"conf":conf,"atr":atr_v,
-                                 "price":price,"signals":sigs,"position":pos,"tp":tp,"sl":sl,"regime":regime})
+            reg = market_regime(closes, highs, lows)
+            regimes.append(reg)
+            tp  = price + atr_v * ATR_TP_MULT
+            sl  = price - atr_v * ATR_SL_MULT
+            rr  = (tp-price) / max(price-sl, price*0.0001)
+            scores[sym] = {"score": sc, "conf": conf, "price": round(price,6),
+                           "rsi": calc_rsi(closes), "signals": sigs, "rr": round(rr,2), "regime": reg}
+            log(f"  {sym:<12} {sc}/6 conf:{conf}% rr:{rr:.1f} {reg}", "SCORE")
+            if rr >= MIN_REWARD_RISK and (sc > best["score"] or (sc == best["score"] and conf > best["conf"])):
+                pos = calc_position_size(state["capital"], price, sl, sc)
+                best.update({"sym":sym,"score":sc,"conf":conf,"atr":atr_v,
+                             "price":price,"signals":sigs,"pos":pos,"tp":tp,"sl":sl})
         except Exception as e:
             scores[sym] = {"score":-1,"conf":0,"price":None,"rsi":None,"signals":{}}
             log(f"  {sym} error: {e}", "ERR")
 
     state["coin_scores"] = scores
     state["best_coin"]   = best["sym"]
-
-    # Market regime consensus
     if regimes:
         from collections import Counter
-        regime_counts = Counter(regimes)
-        state["market_regime"] = regime_counts.most_common(1)[0][0]
+        state["market_regime"] = Counter(regimes).most_common(1)[0][0]
 
-    # ── Sensei decision ──────────────────────────────
-    if best["score"] >= min_sig and best["sym"]:
+    if best["score"] >= min_s and best["sym"]:
         sym   = best["sym"]
         price = best["price"]
-        tp    = best["tp"]
-        sl    = best["sl"]
-        pos   = best["position"]
+        pos   = best["pos"]
         sigs  = best["signals"]
-        score = best["score"]
+        log(f"🎌 ENTERING: {sym} | {best['score']}/6 signals | conf:{best['conf']}% | ₹{pos}", "TRADE")
+        for name, fired in sigs.items():
+            log(f"  {'✅' if fired else '⬜'} {name}", "SIG")
 
-        regime_note = best.get("regime","?")
-        log(f"🎌 SENSEI ENTERS: {sym} | {score}/6 signals | conf:{best['conf']}% | pos:₹{pos} | {regime_note}", "TRADE")
-        log(f"   Entry:₹{price:.5f} | TP:₹{tp:.5f}(+{(tp/price-1)*100:.2f}%) | SL:₹{sl:.5f}(-{(1-sl/price)*100:.2f}%)", "TRADE")
-
-        result = place_order(sym, "BUY", pos, price)
-        if "error" not in str(result).lower():
+        code, result = place_order(sym, "BUY", pos, price)
+        if code == 200:
+            entry = best["price"]
             state.update({
-                "in_trade":True,"trade_sym":sym,
-                "entry_price":price,"tp_price":tp,"sl_price":sl,
-                "trail_sl":sl,"peak_price":price,
-                "position_size":pos,"signals_detail":sigs,
-                "live_pnl":0.0,"sensei_mood":"IN_TRADE",
+                "in_trade": True, "trade_sym": sym,
+                "entry_price": entry, "tp_price": best["tp"], "sl_price": best["sl"],
+                "trail_sl": best["sl"], "peak_price": entry,
+                "position_size": pos, "signals_detail": sigs, "live_pnl": 0.0,
+                "sensei_mood": "IN_TRADE",
             })
-            # Log all signals that fired
-            for sig_name, fired in sigs.items():
-                log(f"   {'✅' if fired else '⬜'} {sig_name}", "SIG")
+            log(f"✅ BUY filled | TP ₹{best['tp']:.6f} | SL ₹{best['sl']:.6f}", "TRADE")
         else:
-            log(f"❌ Order failed: {result}", "ERR")
+            log(f"❌ Order failed [{code}]: {result}", "ERR")
             state["sensei_mood"] = "PATIENT"
     else:
         state["sensei_mood"] = "PATIENT"
-        needed = min_sig - best["score"] if best["score"] >= 0 else min_sig
-        # Show why market isn't trading
-        overbought = [s for s,info in scores.items() if info.get("rsi") and info["rsi"] > 70]
-        msg = f"⏳ Best: {best['sym']} {best['score']}/6 signals — need {min_sig} to trade"
-        if best["score"] > 0:
-            msg += f" ({needed} more signal{'s' if needed>1 else ''} needed)"
-        log(msg, "WAIT")
-        if len(overbought) > 6:
-            log(f"⚠️  {len(overbought)}/12 coins overbought (RSI>70) — market heated, patience pays", "WARN")
-        elif best["score"] >= 3:
-            log(f"💡 Getting closer — {best['sym']} at {best['score']}/6. Next scan in {SCAN_INTERVAL}s", "INFO")
+        needed = min_s - best["score"] if best["score"] >= 0 else min_s
+        log(f"⏳ Best: {best['sym']} {best['score']}/6 — need {min_s} ({needed} more)", "WAIT")
+        overbought = sum(1 for v in scores.values() if v.get("rsi") and v["rsi"] > 70)
+        if overbought > 7:
+            log(f"⚠️ {overbought}/12 coins overbought (RSI>70) — waiting for cooldown", "WARN")
 
-    return jsonify({"action":"scanned"})
+    return jsonify({"action": "scanned"})
+
+@app.route("/api/wallet/refresh", methods=["POST"])
+@login_required
+def api_wallet_refresh():
+    threading.Thread(target=fetch_wallet, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/api/debug")
+@login_required
+def api_debug():
+    """Full API diagnostic — visit /api/debug in browser to check everything."""
+    results = {}
+    results["api_key_set"]    = CS_API_KEY != "YOUR_API_KEY"
+    results["secret_key_set"] = CS_SECRET_KEY != "YOUR_SECRET_KEY"
+    results["secret_is_hex"]  = all(c in "0123456789abcdefABCDEF" for c in CS_SECRET_KEY)
+    results["secret_len"]     = len(CS_SECRET_KEY)
+    try:
+        code, data = cs_get("/trade/api/v2/time")
+        results["server_time"] = data
+    except Exception as e:
+        results["server_time_error"] = str(e)
+    try:
+        ok = validate_keys()
+        results["keys_valid"] = ok
+    except Exception as e:
+        results["keys_error"] = str(e)
+    try:
+        code, data = cs_get("/trade/api/v2/user/portfolio")
+        results["portfolio_status"] = code
+        results["portfolio"] = str(data)[:500]
+    except Exception as e:
+        results["portfolio_error"] = str(e)
+    try:
+        code, data = cs_get("/trade/api/v2/coins", {"exchange": EXCHANGE})
+        coins = data.get("data", {}).get(EXCHANGE, [])
+        results["coins_count"] = len(coins)
+        results["matic_listed"] = "MATIC/INR" in coins
+        results["sample_coins"] = coins[:5]
+    except Exception as e:
+        results["coins_error"] = str(e)
+    return jsonify(results)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
