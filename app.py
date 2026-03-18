@@ -55,12 +55,12 @@ BINANCE_MAP = {
 MAX_RISK_PER_TRADE = 0.02   # Never risk more than 2% of capital
 MAX_DAILY_LOSS     = 0.06   # Stop trading if down 6% today
 MAX_DAILY_TRADES   = 12     # Quality over quantity
-MIN_REWARD_RISK    = 2.0    # Only take trades with 2:1 reward/risk minimum
+MIN_REWARD_RISK    = 1.5    # Min 1.5:1 reward/risk (2.0 was blocking good setups)
 TRAILING_STOP      = True   # Move stop loss up as trade profits
 
 # ── Dynamic TP/SL based on ATR (market adapts automatically) ──
-ATR_TP_MULT  = 3.0   # TP = entry + 3.0 × ATR  (more room to win)
-ATR_SL_MULT  = 1.5   # SL = entry - 1.5 × ATR  (stops premature exits)
+ATR_TP_MULT  = 2.0   # TP = entry + 2.0 × ATR (achievable in ranging markets)
+ATR_SL_MULT  = 1.0   # SL = entry - 1.0 × ATR (tight but not too tight)
 
 # ══════════════════════════════════════════════════════════════
 #  SENSEI SIGNAL ENGINE — 6 independent confirmations
@@ -859,6 +859,7 @@ def api_candles():
     # ═══════════════════════════════════════════════════
     state["sensei_mood"] = "HUNTING"
     log(f"🔍 Sensei scanning {len(all_c)} coins for high-probability setups...", "SCAN")
+    state["market_regime"]  # will be updated below
     scores = {}
     best   = {"sym":None,"score":0,"conf":0,"atr":0,"price":0,"signals":{},"position":0}
     regimes = []
@@ -891,9 +892,9 @@ def api_candles():
 
             if sc > best["score"] or (sc == best["score"] and conf > best["conf"]):
                 if rr >= MIN_REWARD_RISK:  # Only consider if RR is good
-                    # Skip low-confidence ranging markets — wait for better setup
-                    if regime == "RANGING" and conf < 15.0 and sc < 5:
-                        log(f"  ⏭️ Skipping {sym} — RANGING market + low conf {conf}%", "WAIT")
+                    # Only skip if VERY low confidence AND very low score
+                    if regime == "RANGING" and conf < 10.0 and sc < 4:
+                        log(f"  ⏭️ Skipping {sym} — low conf {conf}% + weak signal", "WAIT")
                         continue
                     pos = calc_position_size(state["capital"], price, sl, sc)
                     best.update({"sym":sym,"score":sc,"conf":conf,"atr":atr_v,
@@ -943,10 +944,16 @@ def api_candles():
     else:
         state["sensei_mood"] = "PATIENT"
         needed = min_sig - best["score"] if best["score"] >= 0 else min_sig
+        # Show why market isn't trading
+        overbought = [s for s,info in scores.items() if info.get("rsi") and info["rsi"] > 70]
         msg = f"⏳ Best: {best['sym']} {best['score']}/6 signals — need {min_sig} to trade"
         if best["score"] > 0:
             msg += f" ({needed} more signal{'s' if needed>1 else ''} needed)"
         log(msg, "WAIT")
+        if len(overbought) > 6:
+            log(f"⚠️  {len(overbought)}/12 coins overbought (RSI>70) — market heated, patience pays", "WARN")
+        elif best["score"] >= 3:
+            log(f"💡 Getting closer — {best['sym']} at {best['score']}/6. Next scan in {SCAN_INTERVAL}s", "INFO")
 
     return jsonify({"action":"scanned"})
 
