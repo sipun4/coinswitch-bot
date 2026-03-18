@@ -24,7 +24,13 @@ CAPITAL       = float(os.environ.get("CAPITAL", "300"))
 
 BASE_URL      = "https://coinswitch.co"
 ALL_PAIRS     = ["DOGE/INR", "XRP/INR", "TRX/INR", "SHIB/INR"]
-BINANCE_MAP   = {"DOGE/INR":"DOGEUSDT","XRP/INR":"XRPUSDT","TRX/INR":"TRXUSDT","SHIB/INR":"SHIBUSDT"}
+# CryptoCompare symbol map (works on all cloud hosts, free, no API key needed)
+CC_MAP = {
+    "DOGE/INR": ("DOGE", "INR"),
+    "XRP/INR":  ("XRP",  "INR"),
+    "TRX/INR":  ("TRX",  "INR"),
+    "SHIB/INR": ("SHIB", "INR"),
+}
 
 TAKE_PROFIT_PCT = 0.006
 STOP_LOSS_PCT   = 0.003
@@ -163,30 +169,53 @@ def win_rate():
 # ════════════════════════════════════════════════════
 #  MARKET DATA (Binance public API → INR)
 # ════════════════════════════════════════════════════
-_inr_cache = {"rate": 83.5, "ts": 0}
-
-def get_inr_rate():
-    if time.time() - _inr_cache["ts"] > 600:
-        try:
-            r = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=8)
-            _inr_cache["rate"] = r.json()["rates"]["INR"]
-        except: pass
-        _inr_cache["ts"] = time.time()
-    return _inr_cache["rate"]
-
 def fetch_candles(symbol, limit=60):
-    sym    = BINANCE_MAP.get(symbol)
-    if not sym: raise ValueError(f"Unknown: {symbol}")
-    r   = requests.get("https://api.binance.com/api/v3/klines",
-                       params={"symbol": sym, "interval":"1m","limit":limit}, timeout=10)
-    raw = r.json()
-    if not isinstance(raw, list) or len(raw) < 30:
-        raise ValueError("Not enough data")
-    inr = get_inr_rate()
-    return ([float(c[4])*inr for c in raw],
-            [float(c[5])     for c in raw],
-            [float(c[2])*inr for c in raw],
-            [float(c[3])*inr for c in raw])
+    """
+    Fetch 1-minute OHLCV candles from CryptoCompare (free, no API key, works everywhere).
+    Returns (closes, volumes, highs, lows) in INR.
+    """
+    pair = CC_MAP.get(symbol)
+    if not pair:
+        raise ValueError(f"Unknown symbol: {symbol}")
+    fsym, tsym = pair
+
+    # Primary: CryptoCompare histominute
+    url = "https://min-api.cryptocompare.com/data/v2/histominute"
+    params = {"fsym": fsym, "tsym": tsym, "limit": limit, "aggregate": 1}
+    try:
+        r   = requests.get(url, params=params, timeout=12,
+                           headers={"User-Agent": "CoinSwitchBot/1.0"})
+        d   = r.json()
+        raw = d.get("Data", {}).get("Data", [])
+        if len(raw) >= 30:
+            closes  = [float(c["close"])       for c in raw]
+            volumes = [float(c["volumefrom"])   for c in raw]
+            highs   = [float(c["high"])         for c in raw]
+            lows    = [float(c["low"])           for c in raw]
+            return closes, volumes, highs, lows
+    except Exception as e:
+        log(f"CryptoCompare error: {e}")
+
+    # Fallback: CoinGecko simple price (no candles, simulate with noise for indicators)
+    try:
+        cg_ids = {"DOGE":"dogecoin","XRP":"ripple","TRX":"tron","SHIB":"shiba-inu"}
+        cg_id  = cg_ids.get(fsym)
+        r2 = requests.get(
+            f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart",
+            params={"vs_currency": "inr", "days": "1", "interval": "minute"},
+            timeout=12, headers={"User-Agent": "CoinSwitchBot/1.0"})
+        prices = r2.json().get("prices", [])
+        vols   = r2.json().get("total_volumes", [])
+        if len(prices) >= 30:
+            closes  = [p[1] for p in prices[-limit:]]
+            volumes = [v[1] for v in vols[-limit:]]
+            highs   = [p * 1.001 for p in closes]
+            lows    = [p * 0.999 for p in closes]
+            return closes, volumes, highs, lows
+    except Exception as e:
+        log(f"CoinGecko fallback error: {e}")
+
+    raise ValueError(f"All data sources failed for {symbol}")
 
 
 # ════════════════════════════════════════════════════
