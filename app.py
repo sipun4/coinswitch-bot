@@ -12,7 +12,10 @@
 ║   6. No trade is also a trade — patience pays                   ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
-import requests, time, hmac, hashlib, json, os, threading, smtplib, math
+import requests, time, json, os, threading, smtplib, math
+from urllib.parse import urlparse, urlencode
+import urllib
+from cryptography.hazmat.primitives.asymmetric import ed25519
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -53,8 +56,8 @@ MIN_REWARD_RISK    = 2.0    # Only take trades with 2:1 reward/risk minimum
 TRAILING_STOP      = True   # Move stop loss up as trade profits
 
 # ── Dynamic TP/SL based on ATR (market adapts automatically) ──
-ATR_TP_MULT  = 2.5   # TP = entry + 2.5 × ATR
-ATR_SL_MULT  = 1.0   # SL = entry - 1.0 × ATR
+ATR_TP_MULT  = 3.0   # TP = entry + 3.0 × ATR  (more room to win)
+ATR_SL_MULT  = 1.5   # SL = entry - 1.5 × ATR  (stops premature exits)
 
 # ══════════════════════════════════════════════════════════════
 #  SENSEI SIGNAL ENGINE — 6 independent confirmations
@@ -286,16 +289,25 @@ def sensei_analyze(closes, volumes, highs, lows):
     }
     score = sum(signals.values())
 
-    # Confidence = how far into bullish territory each indicator is
+    # Confidence = weighted scoring of how strongly each signal fires
+    ema_gap_pct   = abs(ef9[-1]-ef21[-1])/price*100
+    macd_strength = abs(mh)/price*10000 if mh>0 else 0
+    rsi_quality   = max(0,(55-abs(rsi_v-50))/55)  # best at RSI=50
+    vol_ratio     = min(2.0, volumes[-1]/avg_vol) if avg_vol>0 else 1.0
+    vwap_quality  = min(1.0, abs(price-vwap_v)/price*100) if price>vwap_v else 0.2
+    stoch_quality = max(0,(70-k)/70) if k<70 else 0
+
     conf_components = [
-        min(1.0, max(0, (ef9[-1]-ef21[-1])/price*100)),   # EMA gap
-        min(1.0, max(0, mh/price*1000)) if mh>0 else 0,   # MACD hist strength
-        min(1.0, max(0, (62-rsi_v)/24)) if rsi_v<=62 else 0,
-        min(1.0, volumes[-1]/avg_vol/2),
-        min(1.0, max(0, (price-vwap_v)/price*50)) if price>vwap_v else 0.3,
-        min(1.0, max(0, (75-k)/75)) if k<75 else 0,
+        min(1.0, ema_gap_pct * 20),       # EMA separation
+        min(1.0, macd_strength * 5),       # MACD histogram power
+        rsi_quality,                        # RSI positioning
+        min(1.0, (vol_ratio-1)*2),         # Volume above average
+        vwap_quality,                       # VWAP distance
+        stoch_quality,                      # Stochastic headroom
     ]
-    confidence = round(sum(conf_components)/len(conf_components)*100, 1)
+    # Only count components where that signal is actually firing
+    fired_confs = [conf_components[i] for i,fired in enumerate([s1,s2,s3,s4,s5,s6]) if fired]
+    confidence = round(sum(fired_confs)/max(1,len(fired_confs))*100, 1) if fired_confs else 0.0
 
     return score, signals, confidence, atr_v, price
 
@@ -330,23 +342,107 @@ def calc_position_size(capital, entry, sl, score):
 # ══════════════════════════════════════════════════════════════
 #  COINSWITCH ORDER
 # ══════════════════════════════════════════════════════════════
-def make_headers(method, endpoint, payload=""):
-    ts  = str(int(time.time()*1000))
-    msg = ts+method+endpoint+(payload or "")
-    sig = hmac.new(CS_SECRET_KEY.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    return {"X-AUTH-APIKEY":CS_API_KEY,"X-AUTH-SIGNATURE":sig,
-            "X-AUTH-EPOCH":ts,"Content-Type":"application/json"}
+def make_signature(method, endpoint, params=None):
+    """
+    CoinSwitch PRO Ed25519 signature — from official docs.
+    signature_msg = METHOD + unquoted_endpoint_with_params + epoch_time
+    """
+    epoch_time = str(int(time.time() * 1000))
+    unquote_endpoint = endpoint
+
+    # For GET requests, append query params to endpoint before signing
+    if method == "GET" and params and len(params) > 0:
+        endpoint += ('&' if urlparse(endpoint).query else '?') + urlencode(params)
+        unquote_endpoint = urllib.parse.unquote_plus(endpoint)
+
+    signature_msg = method + unquote_endpoint + epoch_time
+    request_string = bytes(signature_msg, 'utf-8')
+
+    # Ed25519 signing
+    secret_key_bytes = bytes.fromhex(CS_SECRET_KEY)
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
+    signature_bytes = private_key.sign(request_string)
+    signature = signature_bytes.hex()
+
+    return signature, epoch_time
+
+def make_headers(method, endpoint, params=None):
+    signature, epoch_time = make_signature(method, endpoint, params)
+    return {
+        "Content-Type":     "application/json",
+        "X-AUTH-APIKEY":    CS_API_KEY,
+        "X-AUTH-SIGNATURE": signature,
+        "X-AUTH-EPOCH":     epoch_time,
+    }
+
+def get_trade_info(symbol):
+    """Get min/max order size and precision for a symbol."""
+    ep = "/trade/api/v2/tradeInfo"
+    try:
+        headers = make_headers("GET", ep)
+        r = requests.get(BASE_URL + ep, headers=headers, timeout=10)
+        data = r.json()
+        # Find the symbol in trade info
+        sym_clean = symbol.replace("/","").lower()
+        for item in data.get("data", []):
+            if item.get("symbol","").lower().replace("/","") == sym_clean:
+                return item
+    except:
+        pass
+    return {}
 
 def place_order(symbol, side, amount_inr, price):
-    ep   = "/trade/api/v2/order"
-    qty  = round(amount_inr / price, 6)
-    body = json.dumps({"symbol":symbol.replace("/",""),"side":side.lower(),
-                       "type":"market","quantity":qty})
+    """
+    Place a real market order on CoinSwitch PRO.
+    Uses correct Ed25519 signature as per official docs.
+    """
+    ep  = "/trade/api/v2/order"
+    # Symbol format: lowercase with slash e.g. "doge/inr"
+    sym = symbol.lower()
+    qty = round(amount_inr / price, 4)
+
+    payload = {
+        "symbol":   sym,
+        "side":     side.lower(),    # "buy" or "sell"
+        "type":     "market",
+        "quantity": qty,
+    }
+    body = json.dumps(payload, separators=(',', ':'))
+
     try:
-        r = requests.post(BASE_URL+ep, headers=make_headers("POST",ep,body), data=body, timeout=10)
+        headers = make_headers("POST", ep)
+        r = requests.post(
+            BASE_URL + ep,
+            headers=headers,
+            data=body,
+            timeout=15
+        )
+        result = r.json()
+        log(f"Order response [{r.status_code}]: {json.dumps(result)[:200]}", "ORDER")
+        return result
+    except Exception as e:
+        log(f"Order exception: {e}", "ERR")
+        return {"error": str(e)}
+
+def get_portfolio():
+    """Get current wallet balances."""
+    ep = "/trade/api/v2/user/portfolio"
+    try:
+        headers = make_headers("GET", ep)
+        r = requests.get(BASE_URL + ep, headers=headers, timeout=10)
         return r.json()
     except Exception as e:
         return {"error": str(e)}
+
+def validate_keys():
+    """Test if API keys work."""
+    ep = "/trade/api/v2/validate/keys"
+    try:
+        headers = make_headers("GET", ep)
+        r = requests.get(BASE_URL + ep, headers=headers, timeout=10)
+        return r.status_code == 200, r.json()
+    except Exception as e:
+        return False, {"error": str(e)}
 
 # ══════════════════════════════════════════════════════════════
 #  FLASK ROUTES
@@ -398,6 +494,15 @@ def api_start():
     })
     log("🎌 SENSEI awakens. Capital ₹"+str(cap)+" | Risk per trade: 2% = ₹"+str(round(cap*0.02)), "START")
     log("📋 Rules: 4/6 signals needed | ATR-based TP/SL | Trailing stop active", "INFO")
+    # Validate API keys on startup
+    def check_keys():
+        time.sleep(1)
+        ok, resp = validate_keys()
+        if ok:
+            log("✅ API keys validated — real trading ACTIVE on CoinSwitch PRO", "START")
+        else:
+            log(f"❌ API key validation failed: {resp} — check Render env vars", "ERR")
+    threading.Thread(target=check_keys, daemon=True).start()
     return jsonify({"ok":True})
 
 @app.route("/api/stop", methods=["POST"])
@@ -529,9 +634,13 @@ def api_candles():
 
             if sc > best["score"] or (sc == best["score"] and conf > best["conf"]):
                 if rr >= MIN_REWARD_RISK:  # Only consider if RR is good
+                    # Skip low-confidence ranging markets — wait for better setup
+                    if regime == "RANGING" and conf < 15.0 and sc < 5:
+                        log(f"  ⏭️ Skipping {sym} — RANGING market + low conf {conf}%", "WAIT")
+                        continue
                     pos = calc_position_size(state["capital"], price, sl, sc)
                     best.update({"sym":sym,"score":sc,"conf":conf,"atr":atr_v,
-                                 "price":price,"signals":sigs,"position":pos,"tp":tp,"sl":sl})
+                                 "price":price,"signals":sigs,"position":pos,"tp":tp,"sl":sl,"regime":regime})
         except Exception as e:
             scores[sym] = {"score":-1,"conf":0,"price":None,"rsi":None,"signals":{}}
             log(f"  {sym} error: {e}", "ERR")
@@ -555,7 +664,8 @@ def api_candles():
         sigs  = best["signals"]
         score = best["score"]
 
-        log(f"🎌 SENSEI ENTERS: {sym} | {score}/6 signals | conf:{best['conf']}% | pos:₹{pos}", "TRADE")
+        regime_note = best.get("regime","?")
+        log(f"🎌 SENSEI ENTERS: {sym} | {score}/6 signals | conf:{best['conf']}% | pos:₹{pos} | {regime_note}", "TRADE")
         log(f"   Entry:₹{price:.5f} | TP:₹{tp:.5f}(+{(tp/price-1)*100:.2f}%) | SL:₹{sl:.5f}(-{(1-sl/price)*100:.2f}%)", "TRADE")
 
         result = place_order(sym, "BUY", pos, price)
