@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SENSEI — Access Required</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@800;900&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  background:#03050b;
+  color:#c0d0e0;
+  font-family:'JetBrains Mono',monospace;
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  overflow:hidden;
+}
+
+/* Animated grid background */
+body::before{
+  content:'';
+  position:fixed;inset:0;
+  background-image:
+    linear-gradient(rgba(0,230,118,.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,230,118,.03) 1px, transparent 1px);
+  background-size:40px 40px;
+  animation:grid-move 20s linear infinite;
+}
+@keyframes grid-move{from{transform:translateY(0)}to{transform:translateY(40px)}}
+
+/* Scanlines */
+body::after{
+  content:'';position:fixed;inset:0;
+  background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.15) 3px,rgba(0,0,0,.15) 4px);
+  pointer-events:none;
+}
+
+.box{
+  position:relative;z-index:10;
+  width:100%;max-width:420px;
+  padding:48px 40px;
+  background:rgba(8,13,24,.95);
+  border:1px solid rgba(0,230,118,.2);
+  border-radius:16px;
+  box-shadow:0 0 80px rgba(0,230,118,.08), 0 0 0 1px rgba(0,230,118,.05);
+  backdrop-filter:blur(20px);
+  animation:fadein .6s ease;
+}
+@keyframes fadein{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+
+/* Glow top line */
+.box::before{
+  content:'';position:absolute;top:0;left:10%;right:10%;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(0,230,118,.8),transparent);
+  border-radius:1px;
+}
+
+.logo{
+  font-family:'Syne',sans-serif;
+  font-size:36px;font-weight:900;
+  color:#00e676;letter-spacing:-2px;
+  text-align:center;margin-bottom:4px;
+  text-shadow:0 0 30px rgba(0,230,118,.4);
+}
+.tagline{
+  text-align:center;font-size:10px;
+  letter-spacing:3px;color:#4a6275;
+  text-transform:uppercase;margin-bottom:36px;
+}
+
+.label{
+  font-size:9px;letter-spacing:2px;
+  text-transform:uppercase;color:#4a6275;
+  margin-bottom:8px;display:block;
+}
+
+.input-wrap{position:relative;margin-bottom:16px;}
+.key-input{
+  width:100%;
+  background:#040810;
+  border:1px solid #1a2535;
+  border-radius:8px;
+  padding:14px 48px 14px 16px;
+  color:#c0d0e0;
+  font-family:'JetBrains Mono',monospace;
+  font-size:16px;
+  letter-spacing:3px;
+  outline:none;
+  transition:.2s;
+}
+.key-input:focus{
+  border-color:#00e676;
+  box-shadow:0 0 0 3px rgba(0,230,118,.1);
+}
+.key-input.error{
+  border-color:#ff3d57;
+  box-shadow:0 0 0 3px rgba(255,61,87,.1);
+  animation:shake .3s ease;
+}
+@keyframes shake{
+  0%,100%{transform:translateX(0)}
+  25%{transform:translateX(-8px)}
+  75%{transform:translateX(8px)}
+}
+
+.eye-btn{
+  position:absolute;right:14px;top:50%;transform:translateY(-50%);
+  background:none;border:none;color:#4a6275;cursor:pointer;
+  font-size:16px;padding:4px;transition:.2s;
+}
+.eye-btn:hover{color:#00e676;}
+
+.submit-btn{
+  width:100%;padding:14px;
+  background:linear-gradient(135deg,#00e676,#1de9b6);
+  color:#000;border:none;border-radius:8px;
+  font-family:'Syne',sans-serif;
+  font-size:14px;font-weight:900;
+  letter-spacing:1px;cursor:pointer;
+  transition:.2s;margin-top:4px;
+  text-transform:uppercase;
+}
+.submit-btn:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,230,118,.3);}
+.submit-btn:active{transform:translateY(0);}
+.submit-btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none;}
+
+.error-msg{
+  color:#ff3d57;font-size:11px;
+  text-align:center;margin-top:12px;
+  padding:8px;background:rgba(255,61,87,.08);
+  border:1px solid rgba(255,61,87,.2);
+  border-radius:6px;
+  display:none;
+}
+.error-msg.show{display:block;animation:fadein .3s ease;}
+
+.footer{
+  text-align:center;margin-top:28px;
+  font-size:10px;color:#2a3f50;
+  line-height:1.8;
+}
+.footer span{color:#4a6275;}
+
+/* Lock icon */
+.lock-icon{
+  text-align:center;font-size:32px;
+  margin-bottom:20px;
+  animation:float 3s ease-in-out infinite;
+}
+@keyframes float{
+  0%,100%{transform:translateY(0)}
+  50%{transform:translateY(-6px)}
+}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="lock-icon">🔐</div>
+  <div class="logo">SENSEI</div>
+  <div class="tagline">50-Year Trading Engine · Secured Access</div>
+
+  <label class="label">Enter Access Key</label>
+  <div class="input-wrap">
+    <input
+      class="key-input"
+      id="key-input"
+      type="password"
+      placeholder="••••••••••••"
+      autocomplete="off"
+      spellcheck="false"
+      autofocus
+    >
+    <button class="eye-btn" onclick="toggleVisibility()" id="eye-btn" type="button">👁</button>
+  </div>
+
+  <button class="submit-btn" id="submit-btn" onclick="doLogin()">
+    ENTER SENSEI
+  </button>
+
+  <div class="error-msg" id="error-msg">
+    ❌ Wrong access key. Please try again.
+  </div>
+
+  <div class="footer">
+    <span>Protected by environment variable ACCESS_KEY</span><br>
+    Set on Render.com → Environment → ACCESS_KEY
+  </div>
+</div>
+
+<script>
+function toggleVisibility() {
+  const inp = document.getElementById("key-input");
+  const btn = document.getElementById("eye-btn");
+  if (inp.type === "password") {
+    inp.type = "text";
+    btn.textContent = "🙈";
+  } else {
+    inp.type = "password";
+    btn.textContent = "👁";
+  }
+}
+
+async function doLogin() {
+  const key = document.getElementById("key-input").value.trim();
+  const btn = document.getElementById("submit-btn");
+  const err = document.getElementById("error-msg");
+  const inp = document.getElementById("key-input");
+
+  if (!key) {
+    inp.classList.add("error");
+    setTimeout(() => inp.classList.remove("error"), 600);
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "VERIFYING...";
+  err.classList.remove("show");
+
+  try {
+    const r = await fetch("/login", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({key})
+    });
+    const d = await r.json();
+
+    if (d.ok) {
+      btn.textContent = "✅ ACCESS GRANTED";
+      btn.style.background = "linear-gradient(135deg,#00e676,#69f0ae)";
+      setTimeout(() => { window.location.href = "/"; }, 600);
+    } else {
+      inp.classList.add("error");
+      err.classList.add("show");
+      btn.textContent = "ENTER SENSEI";
+      btn.disabled = false;
+      setTimeout(() => inp.classList.remove("error"), 600);
+      inp.value = "";
+      inp.focus();
+    }
+  } catch(e) {
+    err.textContent = "❌ Connection error. Try again.";
+    err.classList.add("show");
+    btn.textContent = "ENTER SENSEI";
+    btn.disabled = false;
+  }
+}
+
+// Enter key submits
+document.getElementById("key-input").addEventListener("keydown", e => {
+  if (e.key === "Enter") doLogin();
+});
+</script>
+</body>
+</html>

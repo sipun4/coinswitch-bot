@@ -12,8 +12,9 @@
 ║   6. No trade is also a trade — patience pays                   ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
-import requests, time, json, os, threading, smtplib, math
+import requests, time, json, os, threading, smtplib, math, secrets
 from urllib.parse import urlparse, urlencode
+from functools import wraps
 import urllib
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from datetime import datetime
@@ -23,6 +24,7 @@ from flask import Flask, render_template, jsonify, request
 from collections import deque
 
 app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)  # Random session key each restart
 
 # ── Environment config ─────────────────────────────────────────
 CS_API_KEY    = os.environ.get("CS_API_KEY",    "YOUR_COINSWITCH_API_KEY")
@@ -31,6 +33,7 @@ GMAIL_USER    = os.environ.get("GMAIL_USER",    "your@gmail.com")
 GMAIL_PASS    = os.environ.get("GMAIL_PASS",    "your_app_password")
 ALERT_EMAIL   = os.environ.get("ALERT_EMAIL",   "your@gmail.com")
 CAPITAL       = float(os.environ.get("CAPITAL", "300"))
+ACCESS_KEY    = os.environ.get("ACCESS_KEY",    "sensei2024")  # Set this on Render!
 BASE_URL      = "https://coinswitch.co"
 
 # ── Universe of coins ──────────────────────────────────────────
@@ -82,6 +85,16 @@ state = {
     "signals_detail": {},
     "session_start": None,
     "best_coin": None,
+    # Live wallet from CoinSwitch PRO
+    "wallet": {
+        "inr_balance":     0.0,
+        "inr_locked":      0.0,
+        "total_value":     0.0,
+        "holdings":        {},
+        "last_updated":    "—",
+        "session_start_inr": 0.0,
+        "session_pnl":     0.0,
+    },
 }
 
 def log(msg, level="INFO"):
@@ -471,15 +484,83 @@ def place_order(symbol, side, amount_inr, price):
         log(f"Order exception: {e}", "ERR")
         return {"error": str(e)}
 
-def get_portfolio():
-    """Get current wallet balances."""
+def fetch_wallet_balance():
+    """
+    Fetch real wallet from CoinSwitch PRO portfolio API.
+    Endpoint: GET /trade/api/v2/user/portfolio
+    Response example:
+    {
+      "data": [
+        {"currency": "INR",  "main_balance": 250.50, "blocked_balance": 50.0},
+        {"currency": "DOGE", "main_balance": 1500.0, "blocked_balance": 0.0},
+        ...
+      ]
+    }
+    Updates state["wallet"] with live balances.
+    """
     ep = "/trade/api/v2/user/portfolio"
     try:
         headers = make_headers("GET", ep)
         r = requests.get(BASE_URL + ep, headers=headers, timeout=10)
-        return r.json()
+        data = r.json()
+
+        if r.status_code != 200:
+            log(f"Portfolio API error [{r.status_code}]: {r.text[:200]}", "ERR")
+            return
+
+        items = data.get("data", [])
+        inr_balance  = 0.0
+        inr_locked   = 0.0
+        holdings     = {}
+
+        for item in items:
+            currency = item.get("currency", "").upper()
+            main_bal = float(item.get("main_balance", 0) or 0)
+            locked   = float(item.get("blocked_balance", 0) or 0)
+
+            if currency == "INR":
+                inr_balance = main_bal
+                inr_locked  = locked
+            elif main_bal > 0 or locked > 0:
+                holdings[currency] = {
+                    "qty":    main_bal,
+                    "locked": locked,
+                }
+
+        # Update state wallet
+        w = state["wallet"]
+        prev_inr = w.get("inr_balance", 0)
+
+        # On first fetch, set session start balance
+        if w.get("session_start_inr", 0) == 0 and inr_balance > 0:
+            w["session_start_inr"] = inr_balance + inr_locked
+            log(f"💳 Wallet loaded — INR: ₹{inr_balance:.2f} available + ₹{inr_locked:.2f} locked", "WALLET")
+            log(f"💳 Session start balance: ₹{w['session_start_inr']:.2f}", "WALLET")
+
+        # Calculate real session P&L from wallet
+        if w["session_start_inr"] > 0:
+            total_now = inr_balance + inr_locked
+            w["session_pnl"] = round(total_now - w["session_start_inr"], 2)
+
+        w["inr_balance"]     = inr_balance
+        w["inr_locked"]      = inr_locked
+        w["total_value"]     = inr_balance + inr_locked
+        w["holdings"]        = holdings
+        w["last_updated"]    = datetime.now().strftime("%H:%M:%S")
+
+        # Log balance change if significant
+        if abs(inr_balance - prev_inr) > 0.01 and prev_inr > 0:
+            diff = inr_balance - prev_inr
+            emoji = "📈" if diff > 0 else "📉"
+            log(f"{emoji} Wallet update: ₹{inr_balance:.2f} available ({'+' if diff>0 else ''}₹{diff:.2f})", "WALLET")
+
     except Exception as e:
-        return {"error": str(e)}
+        log(f"Wallet fetch error: {e}", "ERR")
+
+def get_portfolio():
+    """Legacy wrapper — calls fetch_wallet_balance."""
+    fetch_wallet_balance()
+    return state["wallet"]
 
 # Cache exchange precision info
 _precision_cache = {}
@@ -522,10 +603,45 @@ def validate_keys():
 # ══════════════════════════════════════════════════════════════
 #  FLASK ROUTES
 # ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  AUTH MIDDLEWARE
+# ══════════════════════════════════════════════════════════════
+from flask import session, redirect, url_for
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("authenticated"):
+            return redirect(url_for("login_page"))
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route("/login", methods=["GET", "POST"])
+def login_page():
+    error = None
+    if request.method == "POST":
+        entered = (request.json or request.form).get("key", "")
+        if entered == ACCESS_KEY:
+            session["authenticated"] = True
+            session.permanent = True
+            return jsonify({"ok": True}) if request.is_json else redirect(url_for("index"))
+        else:
+            if request.is_json:
+                return jsonify({"ok": False, "error": "Wrong access key"}), 401
+            error = "Wrong key. Try again."
+    return render_template("login.html", error=error)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login_page"))
+
 @app.route("/")
+@login_required
 def index(): return render_template("index.html")
 
 @app.route("/api/state")
+@login_required
 def api_state():
     t = state["wins"] + state["losses"]
     logs = [{"ts":l["ts"],"msg":l["msg"],"level":l["level"]} for l in list(state["log"])[:30]]
@@ -556,6 +672,15 @@ def api_state():
         "signals_detail":state["signals_detail"],
         "best_coin":     state["best_coin"],
         "daily_loss_pct":round(daily_loss_pct(), 1),
+        "wallet": {
+            "inr_balance":   round(state["wallet"]["inr_balance"], 2),
+            "inr_locked":    round(state["wallet"]["inr_locked"], 2),
+            "total_value":   round(state["wallet"]["total_value"], 2),
+            "holdings":      state["wallet"]["holdings"],
+            "last_updated":  state["wallet"]["last_updated"],
+            "session_start": round(state["wallet"]["session_start_inr"], 2),
+            "session_pnl":   round(state["wallet"]["session_pnl"], 2),
+        },
     })
 
 @app.route("/api/start", methods=["POST"])
@@ -570,14 +695,16 @@ def api_start():
     log("🎌 SENSEI awakens. Capital ₹"+str(cap)+" | Risk per trade: 2% = ₹"+str(round(cap*0.02)), "START")
     log("📋 Rules: 4/6 signals needed | ATR-based TP/SL | Trailing stop active", "INFO")
     # Validate API keys on startup
-    def check_keys():
+    def check_keys_and_wallet():
         time.sleep(1)
         ok, resp = validate_keys()
         if ok:
             log("✅ API keys validated — real trading ACTIVE on CoinSwitch PRO", "START")
+            time.sleep(0.5)
+            fetch_wallet_balance()   # Load real wallet immediately
         else:
             log(f"❌ API key validation failed: {resp} — check Render env vars", "ERR")
-    threading.Thread(target=check_keys, daemon=True).start()
+    threading.Thread(target=check_keys_and_wallet, daemon=True).start()
     return jsonify({"ok":True})
 
 @app.route("/api/stop", methods=["POST"])
@@ -587,7 +714,15 @@ def api_stop():
     log(f"🏁 Session ended | P&L: ₹{state['total_pnl']:.2f} | WR: {win_rate():.1f}%", "STOP")
     return jsonify({"ok":True})
 
+@app.route("/api/wallet/refresh", methods=["POST"])
+@login_required
+def api_wallet_refresh():
+    """Manually refresh wallet balance."""
+    threading.Thread(target=fetch_wallet_balance, daemon=True).start()
+    return jsonify({"ok": True, "msg": "Wallet refresh triggered"})
+
 @app.route("/api/debug/keys")
+@login_required
 def debug_keys():
     """Test API keys and return detailed diagnosis."""
     results = {}
@@ -711,6 +846,8 @@ def api_candles():
                           "peak_price":0.0,"trail_sl":0.0,"sensei_mood":"PATIENT"})
             log(f"{'💰 WIN' if pnl>=0 else '🛑 LOSS'} {sym} | ₹{pnl:+.2f} | Total ₹{state['total_pnl']:.2f} | WR {win_rate():.1f}%",
                 "WIN" if pnl>=0 else "LOSS")
+            # Refresh wallet after trade to show real balance change
+            threading.Thread(target=fetch_wallet_balance, daemon=True).start()
             threading.Thread(target=send_alert,
                 args=(sym,entry_was,price,pnl,reason,sigs), daemon=True).start()
         else:

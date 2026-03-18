@@ -17,3 +17,5 @@ services:
         sync: false
       - key: CAPITAL
         value: "300"
+      - key: ACCESS_KEY
+        sync: false          # Set your secret access key here

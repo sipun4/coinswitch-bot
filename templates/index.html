@@ -196,19 +196,42 @@ tr:hover td{background:rgba(24,255,255,.015)}
 
 <main>
   <!-- STATS -->
+  <!-- LIVE WALLET BANNER -->
+  <div style="grid-column:1/-1;background:linear-gradient(135deg,rgba(0,230,118,.07),rgba(24,255,255,.04));border:1px solid rgba(0,230,118,.25);border-radius:10px;padding:14px 20px;display:grid;grid-template-columns:repeat(5,1fr);gap:12px;align-items:center">
+    <div>
+      <div style="font-size:9px;letter-spacing:2px;color:var(--mu);text-transform:uppercase;margin-bottom:4px">💳 Wallet INR (Available)</div>
+      <div style="font-size:26px;font-weight:900;font-family:'Syne',sans-serif;color:var(--g)" id="w-inr">₹—</div>
+      <div style="font-size:10px;color:var(--mu)" id="w-locked">Locked: ₹—</div>
+    </div>
+    <div>
+      <div style="font-size:9px;letter-spacing:2px;color:var(--mu);text-transform:uppercase;margin-bottom:4px">💰 Total Wallet Value</div>
+      <div style="font-size:26px;font-weight:900;font-family:'Syne',sans-serif;color:var(--c)" id="w-total">₹—</div>
+      <div style="font-size:10px;color:var(--mu)" id="w-updated">Updated: —</div>
+    </div>
+    <div>
+      <div style="font-size:9px;letter-spacing:2px;color:var(--mu);text-transform:uppercase;margin-bottom:4px">📊 Session Start</div>
+      <div style="font-size:26px;font-weight:900;font-family:'Syne',sans-serif;color:var(--tx)" id="w-start">₹—</div>
+      <div style="font-size:10px;color:var(--mu)">when bot started</div>
+    </div>
+    <div>
+      <div style="font-size:9px;letter-spacing:2px;color:var(--mu);text-transform:uppercase;margin-bottom:4px">📈 Real Session P&L</div>
+      <div style="font-size:26px;font-weight:900;font-family:'Syne',sans-serif" id="w-spnl">₹0.00</div>
+      <div style="font-size:10px;color:var(--mu)">actual wallet change</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      <button onclick="refreshWallet()" style="background:rgba(0,230,118,.12);border:1px solid rgba(0,230,118,.3);color:var(--g);padding:8px 14px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;cursor:pointer;letter-spacing:.5px">🔄 REFRESH WALLET</button>
+      <div id="w-holdings" style="font-size:10px;color:var(--mu);line-height:1.6">Holdings: —</div>
+    </div>
+  </div>
+
   <div class="stats">
     <div class="card">
-      <div class="cl">Capital</div>
+      <div class="cl">Bot Capital</div>
       <div class="cv c" id="s-cap">₹—</div>
       <div class="cv-sub" id="s-session">Session: —</div>
     </div>
     <div class="card">
-      <div class="cl">Current Value</div>
-      <div class="cv" id="s-cur">₹—</div>
-      <div class="risk-bar-wrap"><div class="risk-bar safe" id="growth-bar" style="width:50%"></div></div>
-    </div>
-    <div class="card">
-      <div class="cl">Total P&L</div>
+      <div class="cl">Bot P&L</div>
       <div class="cv" id="s-pnl">₹0.00</div>
       <div class="cv-sub" id="s-dpnl">Today: ₹0.00</div>
     </div>
@@ -236,6 +259,11 @@ tr:hover td{background:rgba(24,255,255,.015)}
       <div class="cl">Trades Today</div>
       <div class="cv c" id="s-td">0/12</div>
       <div class="cv-sub">max 12 per day</div>
+    </div>
+    <div class="card">
+      <div class="cl">Per Trade Size</div>
+      <div class="cv p" id="s-pertrade">₹—</div>
+      <div class="cv-sub">30% of capital</div>
     </div>
   </div>
 
@@ -451,19 +479,32 @@ function updateUI(d){
   document.getElementById("mood").textContent=mood.replace("_"," ");
   document.getElementById("mood").className="mood-badge mood-"+mood;
 
+  // ── LIVE WALLET ──────────────────────────────────────
+  const w = d.wallet || {};
+  if (w.inr_balance != null) {
+    document.getElementById("w-inr").textContent   = "₹" + w.inr_balance.toFixed(2);
+    document.getElementById("w-locked").textContent = "Locked: ₹" + (w.inr_locked||0).toFixed(2);
+    document.getElementById("w-total").textContent  = "₹" + (w.total_value||0).toFixed(2);
+    document.getElementById("w-updated").textContent = "Updated: " + (w.last_updated||"—");
+    document.getElementById("w-start").textContent  = w.session_start > 0 ? "₹"+w.session_start.toFixed(2) : "₹—";
+    const spnl = w.session_pnl || 0;
+    const spEl = document.getElementById("w-spnl");
+    spEl.textContent = fmtP(spnl);
+    spEl.style.color = spnl >= 0 ? "var(--g)" : "var(--r)";
+    // Holdings
+    const holdings = w.holdings || {};
+    const hkeys = Object.keys(holdings).filter(k => holdings[k].qty > 0);
+    document.getElementById("w-holdings").textContent = hkeys.length > 0
+      ? "Holding: " + hkeys.map(k => k + " " + parseFloat(holdings[k].qty).toFixed(4)).join(", ")
+      : "No crypto holdings";
+  }
+
   // Stats
   document.getElementById("s-cap").textContent="₹"+d.capital;
   document.getElementById("s-session").textContent="Session: "+(d.session_start||"—");
-  const ce=document.getElementById("s-cur");ce.textContent="₹"+d.current;ce.className="cv "+(d.current>=d.capital?"g":"r");
-
-  // Growth bar
-  const growthPct=Math.min(100,Math.max(0,50+((d.current-d.capital)/d.capital*500)));
-  const gb=document.getElementById("growth-bar");
-  gb.style.width=growthPct+"%";
-  gb.className="risk-bar "+(d.current>=d.capital?"safe":"danger");
-
   const pe=document.getElementById("s-pnl");pe.textContent=fmtP(d.pnl);pe.className="cv "+(d.pnl>=0?"g":"r");
   document.getElementById("s-dpnl").textContent="Today: "+fmtP(d.daily_pnl||0);
+  document.getElementById("s-pertrade").textContent="₹"+(d.per_trade||0);
   document.getElementById("s-wr").textContent=d.win_rate+"%";
 
   // WR bar
@@ -598,9 +639,22 @@ async function poll(){
   try{const r=await fetch("/api/state");updateUI(await r.json());}catch(e){}
 }
 
+async function refreshWallet() {
+  const btn = document.querySelector("button[onclick='refreshWallet()']");
+  if (btn) { btn.textContent = "⏳ Refreshing..."; btn.disabled = true; }
+  try {
+    await fetch("/api/wallet/refresh", {method:"POST"});
+    await poll();  // immediate poll to show updated data
+  } finally {
+    if (btn) { btn.textContent = "🔄 REFRESH WALLET"; btn.disabled = false; }
+  }
+}
+
 refreshInr();
 poll();
 setInterval(poll,2500);
+// Refresh wallet every 30 seconds automatically
+setInterval(async () => { if(running) await fetch("/api/wallet/refresh",{method:"POST"}); }, 30000);
 </script>
 </body>
 </html>
