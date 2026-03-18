@@ -282,13 +282,6 @@ tr:hover td{background:rgba(24,255,255,.015)}
       </div>
     </div>
     <div class="irow">
-      <div class="ig"><label>Scan Interval</label>
-        <select id="interval-in">
-          <option value="10" selected>10 seconds</option>
-          <option value="30">30 seconds</option>
-          <option value="60">60 seconds</option>
-        </select>
-      </div>
       <div class="ig"><label>Alert Email</label><input placeholder="Set ALERT_EMAIL on Render" readonly style="opacity:.5;cursor:not-allowed"></div>
     </div>
     <div class="btns">
@@ -437,8 +430,8 @@ async function scan(){
 
 function startLoop(){
   scan();
-  const iv=parseInt(document.getElementById("interval-in").value)*1000||60000;
-  scanTimer=setInterval(scan,iv);
+  // Fixed 30s for signal scanning — SL/TP monitoring is now realtime via WebSocket
+  scanTimer=setInterval(scan,30000);
 }
 function stopLoop(){if(scanTimer){clearInterval(scanTimer);scanTimer=null;}}
 

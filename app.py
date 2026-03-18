@@ -1,8 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║  SENSEI BOT v6 — REALTIME WebSocket Edition                       ║
-║  CoinSwitch WebSocket: wss://ws.coinswitch.co/                   ║
-║  Live ticker every 1 second — instant SL/TP execution            ║
+║  Docs: https://api-trading.coinswitch.co/                        ║
+║  WebSocket: wss://ws.coinswitch.co/ — live trades per second     ║
+║  Scan: 30s fixed for signals — SL/TP instant via WebSocket       ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -58,10 +59,11 @@ MAX_DAILY_TRADES   = 6     # Fewer, better quality trades
 MAX_DAILY_LOSS_PCT = 0.04  # Stop day at 4% loss
 MIN_ORDER_INR      = 100.0 # Safe buffer above CoinSwitch minimum
 
-# WebSocket config — CoinSwitch realtime ticker
-WS_BASE_URL      = "https://ws.coinswitch.co"
-WS_SOCKET_PATH   = "pro/realtime-rates-socket/spot"
-WS_NAMESPACE     = "/coinswitchx"
+# WebSocket config — exact values from CoinSwitch docs
+WS_BASE_URL    = "https://ws.coinswitch.co"
+WS_PATH        = "pro/realtime-rates-socket/spot"
+WS_NAMESPACE   = "/coinswitchx"
+WS_EVENT       = "FETCH_TRADES_CS_PRO"
 
 # ══════════════════════════════════════════════════════════
 #  STATE
@@ -86,9 +88,9 @@ state = {
     },
     "precision_cache": {},   # {symbol: {base, quote, limit}}
     "open_order_id": None,   # Track open order for status checking
-    "live_prices": {},       # {symbol: float} — realtime from WebSocket
-    "ws_connected": False,   # WebSocket connection status
-    "ws_subscribed": [],     # symbols currently subscribed
+    "live_prices":   {},     # {symbol: float} updated by WebSocket
+    "ws_connected":  False,  # WebSocket live status
+    "ws_subscribed": [],     # currently subscribed symbols
 }
 
 def log(msg, level="INFO"):
@@ -150,208 +152,154 @@ def cs_post(endpoint, payload):
     return r.status_code, r.json()
 
 def cs_delete(endpoint, payload):
-    """Authenticated DELETE — docs: signature = method + endpoint + epoch_time."""
-    epoch_time  = str(int(time.time() * 1000))
-    sig_msg     = "DELETE" + endpoint + epoch_time
+    """DELETE per docs: signature = method + endpoint + sorted_json_body (no epoch)."""
+    body_str    = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+    sig_msg     = "DELETE" + endpoint + body_str
     private_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(CS_SECRET_KEY))
     signature   = private_key.sign(bytes(sig_msg, 'utf-8')).hex()
     headers = {
-        "Content-Type": "application/json",
-        "X-AUTH-APIKEY": CS_API_KEY,
+        "Content-Type":     "application/json",
+        "X-AUTH-APIKEY":    CS_API_KEY,
         "X-AUTH-SIGNATURE": signature,
-        "X-AUTH-EPOCH": epoch_time,
     }
-    r = requests.delete(BASE_URL + endpoint, headers=headers,
-                        data=json.dumps(payload, separators=(',', ':')), timeout=12)
+    r = requests.delete(BASE_URL + endpoint, headers=headers, data=body_str, timeout=12)
     return r.status_code, r.json()
 
 # ══════════════════════════════════════════════════════════
-#  REALTIME WEBSOCKET — CoinSwitch live ticker
-#  Docs: wss://ws.coinswitch.co/
-#  Event: FETCH_TRADES_CS_PRO  (live trade prices)
-#  Namespace: /coinswitchx
+#  REALTIME WEBSOCKET — CoinSwitch live trades
+#  Docs: Socket.IO v4
+#  Base URL: wss://ws.coinswitch.co/
+#  Path: pro/realtime-rates-socket/spot
+#  Namespace: /coinswitchx  Event: FETCH_TRADES_CS_PRO
+#  Pair format: "DOGE,INR"  Response: {p: price, s: "DOGE,INR"}
 # ══════════════════════════════════════════════════════════
-_ws_sio   = None   # socket.io client instance
-_ws_lock  = threading.Lock()
+_ws_sio  = None
+_ws_lock = threading.Lock()
 
 def _ws_on_trade(data):
-    """Called on every live trade — updates live_prices and checks SL/TP instantly."""
+    """Live trade — instant SL/TP check on every price tick."""
     try:
-        sym_raw = data.get("s", "")                    # e.g. "DOGE,INR"
+        sym_raw = data.get("s", "")
         price   = float(data.get("p", 0))
-        if not sym_raw or not price:
-            return
-        symbol = sym_raw.replace(",", "/")             # → "DOGE/INR"
+        if not sym_raw or not price: return
+        symbol = sym_raw.replace(",", "/")
         state["live_prices"][symbol] = price
-
-        # ── Realtime SL/TP check ──────────────────────────
-        if not state["in_trade"] or state["trade_sym"] != symbol:
-            return
-
-        entry   = state["entry_price"]
-        tp      = state["tp_price"]
-        sl      = state["sl_price"]
-        pos     = state.get("position_size", state["per_trade"])
-        lpnl    = round((price - entry) / entry * pos, 2)
-        state["live_pnl"] = lpnl
-
-        # Trailing stop update
+        if not state["in_trade"] or state["trade_sym"] != symbol: return
+        entry = state["entry_price"]
+        tp    = state["tp_price"]
+        sl    = state["sl_price"]
+        pos   = state.get("position_size", state["per_trade"])
+        state["live_pnl"] = round((price - entry) / entry * pos, 2)
         if price > state["peak_price"]:
             state["peak_price"] = price
-            atr_approx = (tp - entry) / ATR_TP_MULT   # re-derive ATR from stored TP
+            atr_approx = (tp - entry) / ATR_TP_MULT
             new_sl = price - atr_approx * ATR_SL_MULT * 1.5
             if new_sl > state["trail_sl"]:
                 state["trail_sl"] = new_sl
                 if new_sl > state["sl_price"]:
                     state["sl_price"] = new_sl
                     log(f"📈 Trail SL → ₹{new_sl:.6f}", "TRAIL")
-
         reason = None
-        if   price >= tp:          reason = "TAKE_PROFIT ✅"
-        elif price <= sl:          reason = "STOP_LOSS 🛑"
-
+        if   price >= tp: reason = "TAKE_PROFIT ✅"
+        elif price <= sl: reason = "STOP_LOSS 🛑"
         if reason:
             log(f"⚡ REALTIME EXIT: {symbol} @ ₹{price:.6f} | {reason}", "TRADE")
-            threading.Thread(target=_execute_exit,
-                             args=(symbol, pos, price, reason), daemon=True).start()
+            threading.Thread(target=_execute_exit, args=(symbol, pos, price, reason), daemon=True).start()
     except Exception as e:
-        log(f"WS trade handler error: {e}", "ERR")
+        log(f"WS trade error: {e}", "ERR")
 
 def _execute_exit(sym, pos, price, reason):
-    """Run in a thread — cancel BUY if open, then SELL with retries."""
+    """Thread-safe: cancel BUY if open, SELL with 3 retries."""
     with _ws_lock:
-        if not state["in_trade"] or state["trade_sym"] != sym:
-            return   # already closed by another call
+        if not state["in_trade"] or state["trade_sym"] != sym: return
         open_oid = state.get("open_order_id")
         if open_oid:
-            buy_status = get_order_status(open_oid)
-            if buy_status in ("OPEN", "PARTIALLY_EXECUTED", "CANCELLATION_RAISED"):
-                log("⚠️ Cancelling unfilled BUY before SELL...", "ORDER")
+            status = get_order_status(open_oid)
+            if status in ("OPEN", "PARTIALLY_EXECUTED", "CANCELLATION_RAISED"):
+                log("⚠️ Cancelling open BUY before SELL...", "ORDER")
                 cancel_order(open_oid)
                 time.sleep(1)
-
         sell_code = 0
         for attempt in range(3):
-            sell_code, sell_result = place_order(sym, "SELL", pos, price)
-            if sell_code == 200:
-                break
-            log(f"⚠️ SELL attempt {attempt+1} failed [{sell_code}] — retrying 2s", "WARN")
+            sell_code, _ = place_order(sym, "SELL", pos, price)
+            if sell_code == 200: break
+            log(f"⚠️ SELL attempt {attempt+1} failed — retry 2s", "WARN")
             time.sleep(2)
-
         if sell_code != 200:
-            log(f"❌ SELL failed after 3 attempts on {sym}", "ERR")
-            return
-
-        pnl = round((price - state["entry_price"]) / state["entry_price"] * pos, 2)
-        state["total_pnl"]    += pnl
-        state["daily_pnl"]    += pnl
-        state["current"]      += pnl
-        state["daily_trades"] += 1
-        if pnl >= 0: state["wins"]   += 1
-        else:        state["losses"] += 1
+            log(f"❌ SELL failed 3x on {sym}", "ERR"); return
+        pnl       = round((price - state["entry_price"]) / state["entry_price"] * pos, 2)
         entry_was = state["entry_price"]
         sigs      = state["signals_detail"].copy()
-        state["trades"].appendleft({
-            "time": state["last_scan"], "sym": sym,
-            "entry": entry_was, "exit": price,
-            "pnl": pnl, "reason": reason,
-            "signals": sum(state["signals_detail"].values()),
-        })
+        state["total_pnl"]    += pnl; state["daily_pnl"] += pnl
+        state["current"]      += pnl; state["daily_trades"] += 1
+        if pnl >= 0: state["wins"] += 1
+        else:        state["losses"] += 1
+        state["trades"].appendleft({"time": state["last_scan"], "sym": sym,
+            "entry": entry_was, "exit": price, "pnl": pnl,
+            "reason": reason, "signals": sum(sigs.values())})
         state.update({"in_trade": False, "trade_sym": None, "live_pnl": 0.0,
                       "peak_price": 0.0, "trail_sl": 0.0, "sensei_mood": "PATIENT",
                       "open_order_id": None, "position_size": 0.0})
         log(f"{'💰 WIN' if pnl>=0 else '🛑 LOSS'} {sym} ₹{pnl:+.2f} | Total ₹{state['total_pnl']:.2f} | WR {win_rate():.1f}%",
             "WIN" if pnl>=0 else "LOSS")
         fetch_wallet()
-        threading.Thread(target=send_alert,
-                         args=(sym, entry_was, price, pnl, reason, sigs), daemon=True).start()
-        # Unsubscribe from this symbol after exit
         ws_unsubscribe(sym)
+        threading.Thread(target=send_alert, args=(sym,entry_was,price,pnl,reason,sigs), daemon=True).start()
 
 def ws_subscribe(symbol):
-    """Subscribe to live trades for a symbol."""
-    global _ws_sio
-    pair = symbol.replace("/", ",")   # "DOGE/INR" → "DOGE,INR"
-    try:
-        if _ws_sio and _ws_sio.connected:
-            _ws_sio.emit("FETCH_TRADES_CS_PRO",
-                         {"event": "subscribe", "pair": pair},
-                         namespace=WS_NAMESPACE)
-            if symbol not in state["ws_subscribed"]:
-                state["ws_subscribed"].append(symbol)
-            log(f"📡 WS subscribed: {symbol}", "WS")
-    except Exception as e:
-        log(f"WS subscribe error {symbol}: {e}", "ERR")
-
-def ws_unsubscribe(symbol):
-    """Unsubscribe from live trades for a symbol."""
     global _ws_sio
     pair = symbol.replace("/", ",")
     try:
         if _ws_sio and _ws_sio.connected:
-            _ws_sio.emit("FETCH_TRADES_CS_PRO",
-                         {"event": "unsubscribe", "pair": pair},
-                         namespace=WS_NAMESPACE)
-            if symbol in state["ws_subscribed"]:
-                state["ws_subscribed"].remove(symbol)
-            log(f"📡 WS unsubscribed: {symbol}", "WS")
-    except Exception as e:
-        log(f"WS unsubscribe error {symbol}: {e}", "ERR")
+            _ws_sio.emit(WS_EVENT, {"event": "subscribe", "pair": pair}, namespace=WS_NAMESPACE)
+            if symbol not in state["ws_subscribed"]: state["ws_subscribed"].append(symbol)
+            log(f"📡 WS subscribed: {symbol}", "WS")
+    except Exception as e: log(f"WS subscribe error: {e}", "ERR")
+
+def ws_unsubscribe(symbol):
+    global _ws_sio
+    pair = symbol.replace("/", ",")
+    try:
+        if _ws_sio and _ws_sio.connected:
+            _ws_sio.emit(WS_EVENT, {"event": "unsubscribe", "pair": pair}, namespace=WS_NAMESPACE)
+        if symbol in state["ws_subscribed"]: state["ws_subscribed"].remove(symbol)
+    except Exception as e: log(f"WS unsubscribe error: {e}", "ERR")
 
 def ws_connect():
-    """Connect to CoinSwitch WebSocket and maintain connection."""
-    global _ws_sio
+    """Connect per docs: python-socketio==5.5.1, websocket-client==1.2.3"""
     def _run():
         global _ws_sio
         while state["running"]:
             try:
                 _ws_sio = sio_client.Client(reconnection=True, reconnection_attempts=10,
-                                            reconnection_delay=3, logger=False,
-                                            engineio_logger=False)
-
+                                            reconnection_delay=3, logger=False, engineio_logger=False)
                 @_ws_sio.event(namespace=WS_NAMESPACE)
                 def connect():
                     state["ws_connected"] = True
                     log("⚡ WebSocket CONNECTED — realtime prices active", "WS")
-                    # Re-subscribe if we had an active trade
                     if state["in_trade"] and state["trade_sym"]:
                         ws_subscribe(state["trade_sym"])
-
                 @_ws_sio.event(namespace=WS_NAMESPACE)
                 def disconnect():
                     state["ws_connected"] = False
                     log("⚠️ WebSocket disconnected — reconnecting...", "WS")
-
-                @_ws_sio.on("FETCH_TRADES_CS_PRO", namespace=WS_NAMESPACE)
-                def on_trade(data):
-                    _ws_on_trade(data)
-
-                _ws_sio.connect(
-                    WS_BASE_URL,
-                    namespaces=[WS_NAMESPACE],
-                    socketio_path=WS_SOCKET_PATH,
-                    transports=["websocket"],
-                    wait_timeout=10,
-                )
+                @_ws_sio.on(WS_EVENT, namespace=WS_NAMESPACE)
+                def on_trade(data): _ws_on_trade(data)
+                _ws_sio.connect(WS_BASE_URL, namespaces=[WS_NAMESPACE],
+                                socketio_path=WS_PATH, transports=["websocket"], wait_timeout=10)
                 _ws_sio.wait()
             except Exception as e:
                 state["ws_connected"] = False
-                log(f"WS connection error: {e} — retry in 5s", "ERR")
-                time.sleep(5)
-
+                log(f"WS error: {e} — retry 5s", "ERR"); time.sleep(5)
     threading.Thread(target=_run, daemon=True, name="ws-thread").start()
     log("🔌 WebSocket thread started", "WS")
 
 def ws_disconnect():
-    """Gracefully disconnect WebSocket."""
     global _ws_sio
     try:
-        if _ws_sio:
-            _ws_sio.disconnect()
-    except:
-        pass
-    state["ws_connected"] = False
-    state["ws_subscribed"] = []
+        if _ws_sio: _ws_sio.disconnect()
+    except: pass
+    state["ws_connected"] = False; state["ws_subscribed"] = []
 
 def validate_keys():
     try:
@@ -382,10 +330,9 @@ def fetch_exchange_precision(symbol):
     return {"base": 4, "quote": 2, "limit": 0}
 
 def fetch_trade_info(symbol):
-    """GET /trade/api/v2/tradeInfo — real min/max INR order size per CoinSwitch docs."""
+    """GET /trade/api/v2/tradeInfo — real min INR order size per docs."""
     cache_key = f"tinfo_{symbol}"
-    if cache_key in state["precision_cache"]:
-        return state["precision_cache"][cache_key]
+    if cache_key in state["precision_cache"]: return state["precision_cache"][cache_key]
     try:
         sym_exch = SYMBOL_EXCHANGE_MAP.get(symbol, EXCHANGE)
         code, data = cs_get("/trade/api/v2/tradeInfo", {"exchange": sym_exch, "symbol": symbol})
@@ -396,8 +343,7 @@ def fetch_trade_info(symbol):
                 result = {"min_order": max(min_order, MIN_ORDER_INR)}
                 state["precision_cache"][cache_key] = result
                 return result
-    except Exception as e:
-        log(f"TradeInfo error {symbol}: {e}", "ERR")
+    except Exception as e: log(f"TradeInfo error {symbol}: {e}", "ERR")
     return {"min_order": MIN_ORDER_INR}
 
 def fetch_depth(symbol):
@@ -613,13 +559,12 @@ def sensei_analyze(closes, volumes, highs, lows):
     obv_now  = calc_obv(closes, volumes)
     obv_prev = calc_obv(closes[:-5], volumes[:-5])
 
-    # Tightened for higher win rate — all conditions stricter
-    c1 = ef9[-1]>ef21[-1] and ef21[-1]>ef50[-1] and price>ef9[-1]   # full EMA stack only
-    c2 = mh > 0 and mh > mh_prev and ml > ms and ml > 0             # MACD positive + rising
-    c3 = 40 <= rsi_v <= 65                                           # tighter RSI zone
-    c4 = volumes[-1] > avg_vol * 1.2 and obv_now > obv_prev          # strong volume surge
-    c5 = price > vwap_v and price <= bb_up * 0.995                   # above VWAP, not overbought
-    c6 = k > d and k < 70 and wr > -60 and wr < -15                 # stoch+WR confirmation
+    c1 = ef9[-1]>ef21[-1] and ef21[-1]>ef50[-1] and price>ef9[-1]
+    c2 = mh > 0 and mh > mh_prev and ml > ms and ml > 0
+    c3 = 40 <= rsi_v <= 65
+    c4 = volumes[-1] > avg_vol * 1.2 and obv_now > obv_prev
+    c5 = price > vwap_v and price <= bb_up * 0.995
+    c6 = k > d and k < 70 and wr > -60 and wr < -15
 
     signals = {
         "Trend EMA (9>21>50)":     c1,
@@ -644,10 +589,10 @@ def sensei_analyze(closes, volumes, highs, lows):
     return score, signals, confidence, atr_v, price
 
 def calc_position_size(capital, entry, sl_price, score):
-    risk_amount  = capital * 0.015            # 1.5% risk per trade
+    risk_amount  = capital * 0.015
     price_risk   = max(entry - sl_price, entry * 0.001)
     raw_position = (risk_amount / price_risk) * entry
-    mult = {6:1.0, 5:0.90}.get(score, 0.75)  # only 5 or 6 signal trades
+    mult = {6:1.0, 5:0.90}.get(score, 0.75)
     pos  = max(MIN_ORDER_INR, min(raw_position * mult, capital * 0.60))
     return round(pos, 2)
 
@@ -836,7 +781,7 @@ def api_start():
         time.sleep(0.2)
         fetch_wallet()
     threading.Thread(target=startup, daemon=True).start()
-    ws_connect()   # Start realtime WebSocket connection
+    ws_connect()
     return jsonify({"ok": True})
 
 @app.route("/api/stop", methods=["POST"])
@@ -968,11 +913,9 @@ def api_candles():
         from collections import Counter
         state["market_regime"] = Counter(regimes).most_common(1)[0][0]
 
-    # Only trade in TRENDING market — skip RANGING and VOLATILE
-    regime_ok = state["market_regime"] in ("TRENDING", "UNKNOWN")
-    if not regime_ok:
+    if state["market_regime"] not in ("TRENDING", "UNKNOWN"):
         state["sensei_mood"] = "PATIENT"
-        log(f"⏸ Market is {state['market_regime']} — waiting for trend", "WAIT")
+        log(f"⏸ Market {state['market_regime']} — waiting for trend", "WAIT")
         return jsonify({"action": "no_trend"})
 
     if best["score"] >= min_s and best["sym"]:
@@ -997,7 +940,7 @@ def api_candles():
                 "sensei_mood": "IN_TRADE",
             })
             log(f"✅ BUY filled | TP ₹{best['tp']:.6f} | SL ₹{best['sl']:.6f}", "TRADE")
-            ws_subscribe(sym)   # Start realtime price monitoring for this symbol
+            ws_subscribe(sym)  # start realtime SL/TP monitoring
         else:
             log(f"❌ Order failed [{code}]: {result}", "ERR")
             state["sensei_mood"] = "PATIENT"
